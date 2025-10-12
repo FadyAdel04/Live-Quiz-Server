@@ -1,0 +1,52 @@
+[
+  {
+    "question": "What is the capital of France?",
+    "options": ["A) Berlin", "B) Paris", "C) Rome", "D) Madrid"],
+    "answer": "B"
+  },
+  {
+    "question": "Which language is used for AI?",
+    "options": ["A) Python", "B) HTML", "C) CSS", "D) JavaScript"],
+    "answer": "A"
+  },
+  {
+    "question": "Which of the following is NOT a programming language?",
+    "options": ["A) Python", "B) Java", "C) HTML", "D) C++"],
+    "answer": "C"
+  },
+  {
+    "question": "What does 'OOP' stand for in programming?",
+    "options": ["A) Object-Oriented Programming", "B) Open Object Process", "C) Overloaded Operation Protocol", "D) Order Of Processing"],
+    "answer": "A"
+  },
+  {
+    "question": "Which of the following is a Python web framework?",
+    "options": ["A) Django", "B) React", "C) Laravel", "D) Flask"],
+    "answer": "A"
+  },
+  {
+    "question": "Which symbol is used to comment a single line in Python?",
+    "options": ["A) //", "B) <!-- -->", "C) #", "D) /* */"],
+    "answer": "C"
+  },
+  {
+    "question": "In JavaScript, which keyword is used to declare a variable?",
+    "options": ["A) var", "B) let", "C) const", "D) All of the above"],
+    "answer": "D"
+  },
+  {
+    "question": "What does SQL stand for?",
+    "options": ["A) Structured Query Language", "B) Simple Question List", "C) System Query Logic", "D) Sequential Query Loop"],
+    "answer": "A"
+  },
+  {
+    "question": "Which data structure uses LIFO (Last In First Out)?",
+    "options": ["A) Queue", "B) Stack", "C) Linked List", "D) Tree"],
+    "answer": "B"
+  },
+  {
+    "question": "Which company developed the C# programming language?",
+    "options": ["A) Google", "B) Microsoft", "C) Apple", "D) IBM"],
+    "answer": "B"
+  }
+]
