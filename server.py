@@ -3,7 +3,7 @@ import threading
 import json
 import time
 
-HOST = '127.0.0.1'
+HOST = '0.0.0.0'
 PORT = 5555
 QUESTION_TIME = 15
 
@@ -22,7 +22,7 @@ def authenticate_user(conn):
     """Ask for username/password and validate."""
     users = load_users()
 
-    for _ in range(3):  # Allow up to 3 login attempts
+    for _ in range(3): 
         conn.sendall("Enter your username: ".encode())
         username = conn.recv(1024).decode().strip()
 
@@ -90,7 +90,7 @@ def handle_client(conn, addr, username):
     leaderboard_text = "\n Leaderboard:\n" + "\n".join([f"{u}: {s}" for u, s in leaderboard])
     broadcast(leaderboard_text)
 
-    conn.close()
+    # conn.close()
 
 
 def start_server():
