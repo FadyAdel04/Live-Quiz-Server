@@ -2,6 +2,7 @@ import socket
 import threading
 import json
 import time
+import traceback  # for detailed error logs
 
 HOST = '0.0.0.0'
 PORT = 5555
@@ -22,7 +23,7 @@ def authenticate_user(conn):
     """Ask for username/password and validate."""
     users = load_users()
 
-    for _ in range(3): 
+    for _ in range(3):
         conn.sendall("Enter your username: ".encode())
         username = conn.recv(1024).decode().strip()
 
@@ -42,7 +43,7 @@ def authenticate_user(conn):
 
 def broadcast(message):
     """Send a message to all connected clients."""
-    for conn in clients.values():
+    for conn in list(clients.values()):
         try:
             conn.sendall(message.encode())
         except:
@@ -50,65 +51,92 @@ def broadcast(message):
 
 
 def handle_client(conn, addr, username):
-    conn.sendall("Welcome to the quiz!\n".encode())
-    time.sleep(1)
+    try:
+        conn.sendall("Welcome to the quiz!\n".encode())
+        time.sleep(1)
 
-    # Load questions
-    with open('questions.json', 'r') as f:
-        questions = json.load(f)
+        with open('questions.json', 'r') as f:
+            questions = json.load(f)
 
-    score = 0
-    for q in questions:
-        question_text = (
-            f"\n{q['question']}\n"
-            + "\n".join(q["options"])
-            + f"\nYou have {QUESTION_TIME} seconds. Enter A/B/C/D: "
-        )
-        conn.sendall(question_text.encode())
+        score = 0
+        for q in questions:
+            question_text = (
+                f"\n{q['question']}\n"
+                + "\n".join(q["options"])
+                + f"\nYou have {QUESTION_TIME} seconds. Enter A/B/C/D: "
+            )
+            conn.sendall(question_text.encode())
 
-        conn.settimeout(QUESTION_TIME)
+            conn.settimeout(QUESTION_TIME)
+            try:
+                answer = conn.recv(1024).decode().strip().upper()
+            except socket.timeout:
+                conn.sendall("⏰ Time’s up!\n".encode())
+                answer = None
+            except (ConnectionResetError, ConnectionAbortedError):
+                print(f"[!] {username} disconnected unexpectedly.")
+                break
+
+            if answer == q['answer']:
+                score += 1
+                conn.sendall("✅ Correct!\n".encode())
+            else:
+                conn.sendall(f"❌ Wrong! Correct answer: {q['answer']}\n".encode())
+
+        with lock:
+            scores[username] = score
+
+        conn.sendall(f"\nYour total score: {score}\n".encode())
+
+        leaderboard = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        leaderboard_text = "\nLeaderboard:\n" + "\n".join([f"{u}: {s}" for u, s in leaderboard])
+        broadcast(leaderboard_text)
+
+    except Exception as e:
+        print(f"[ERROR] Error handling {username} from {addr}: {e}")
+        traceback.print_exc()  # print full error details for debugging
         try:
-            answer = conn.recv(1024).decode().strip().upper()
-        except socket.timeout:
-            conn.sendall(" Time’s up!\n".encode())
-            answer = None
-
-        if answer == q['answer']:
-            score += 1
-            conn.sendall("✅ Correct!\n".encode())
-        else:
-            conn.sendall(f"❌ Wrong! Correct answer: {q['answer']}\n".encode())
-
-    with lock:
-        scores[username] = score
-
-    # Send final score
-    conn.sendall(f"\n Your total score: {score}\n".encode())
-
-    # Send leaderboard
-    leaderboard = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    leaderboard_text = "\n Leaderboard:\n" + "\n".join([f"{u}: {s}" for u, s in leaderboard])
-    broadcast(leaderboard_text)
-
-    # conn.close()
+            conn.sendall("⚠️ Something went wrong on the server. Please try again later.\n".encode())
+        except:
+            pass
+    finally:
+        conn.close()
+        with lock:
+            if username in clients:
+                del clients[username]
+        print(f"❌ Connection closed for {username}")
 
 
 def start_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, PORT))
-    server.listen()
+    try:
+        server.bind((HOST, PORT))
+        server.listen()
+        print(f"✅ Server started on {HOST}:{PORT}")
 
-    print(f"Server started on {HOST}:{PORT}")
+        while True:
+            try:
+                conn, addr = server.accept()
+                print(f"[NEW CONNECTION] {addr}")
 
-    while True:
-        conn, addr = server.accept()
-        username = authenticate_user(conn)
-        if not username:
-            continue 
+                username = authenticate_user(conn)
+                if not username:
+                    continue
 
-        clients[username] = conn
-        print(f"{username} connected from {addr}")
-        threading.Thread(target=handle_client, args=(conn, addr, username)).start()
+                clients[username] = conn
+                print(f"{username} connected from {addr}")
+
+                threading.Thread(target=handle_client, args=(conn, addr, username), daemon=True).start()
+
+            except Exception as e:
+                print(f"[SERVER ERROR] {e}")
+                traceback.print_exc()
+    except Exception as e:
+        print(f"❌ Failed to start server: {e}")
+        traceback.print_exc()
+    finally:
+        server.close()
+        print("🛑 Server stopped.")
 
 
 if __name__ == "__main__":
