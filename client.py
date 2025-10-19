@@ -1,46 +1,32 @@
 import socket
 import threading
-import sys
-import time
 
-SERVER_IP = '192.168.1.11'
-SERVER_PORT = 5555
-BUFFER_SIZE = 4096
+HOST = '192.168.1.11'
+PORT = 5555
 
 def receive_messages(client):
-    """Listen for incoming messages from server."""
     while True:
         try:
-            data, _ = client.recvfrom(BUFFER_SIZE)
-            message = data.decode()
+            message = client.recv(1024).decode()
+            if not message:
+                break
             print(message)
-        except Exception as e:
-            print(f"⚠️ Connection error: {e}")
+        except:
             break
 
 def main():
-    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_addr = (SERVER_IP, SERVER_PORT)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect((HOST, PORT))
 
-    try:
-        # Initiate connection
-        client.sendto("HELLO".encode(), server_addr)
-        threading.Thread(target=receive_messages, args=(client,), daemon=True).start()
+    threading.Thread(target=receive_messages, args=(client,), daemon=True).start()
 
-        while True:
-            msg = input()
-            if msg.lower() == "exit":
-                print("👋 Exiting quiz. Goodbye!")
-                break
-            client.sendto(msg.encode(), server_addr)
+    while True:
+        msg = input()
+        if msg.lower() == 'exit':
+            break
+        client.sendall(msg.encode())
 
-    except KeyboardInterrupt:
-        print("\n👋 Client closed manually.")
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-    finally:
-        client.close()
-        sys.exit()
+    client.close()
 
 if __name__ == "__main__":
     main()
