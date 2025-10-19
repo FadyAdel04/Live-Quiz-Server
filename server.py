@@ -2,7 +2,7 @@ import socket
 import threading
 import json
 import time
-import traceback  # for detailed error logging
+import traceback
 
 HOST = '0.0.0.0'
 PORT = 8080
@@ -39,6 +39,7 @@ def authenticate_user(conn):
             password = conn.recv(1024).decode().strip()
         except Exception as e:
             print(f"⚠️ Connection error during authentication: {e}")
+            send_error_with_delay(conn, f"Connection error during authentication: {e}")
             return None
 
         if username in users and users[username] == password:
@@ -66,6 +67,17 @@ def broadcast(message):
                     break
 
 
+def send_error_with_delay(conn, message):
+    """Wait 3 seconds then send error log message to client."""
+    def delayed_send():
+        time.sleep(3)
+        try:
+            conn.sendall(f"\n⚠️ Error log: {message}\n".encode())
+        except:
+            pass
+    threading.Thread(target=delayed_send, daemon=True).start()
+
+
 def handle_client(conn, addr, username):
     """Handle individual client session."""
     try:
@@ -90,8 +102,9 @@ def handle_client(conn, addr, username):
             except socket.timeout:
                 conn.sendall("⏰ Time’s up!\n".encode())
                 answer = None
-            except Exception:
+            except Exception as e:
                 conn.sendall("⚠️ Error receiving your answer.\n".encode())
+                send_error_with_delay(conn, f"Error receiving answer: {e}")
                 answer = None
 
             if answer == q['answer']:
@@ -113,6 +126,7 @@ def handle_client(conn, addr, username):
     except Exception as e:
         print(f"❌ Error handling client {username}: {e}")
         traceback.print_exc()
+        send_error_with_delay(conn, f"Server error: {e}")
     finally:
         conn.close()
         with lock:
