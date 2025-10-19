@@ -3,53 +3,44 @@ import threading
 import sys
 import time
 
-HOST = '192.168.1.11'
-PORT = 5555
+SERVER_IP = '192.168.1.11'
+SERVER_PORT = 5555
+BUFFER_SIZE = 4096
 
 def receive_messages(client):
+    """Listen for incoming messages from server."""
     while True:
         try:
-            message = client.recv(1024).decode()
-            if not message:
-                print("⚠️ Server disconnected. Please try again later.")
-                break
+            data, _ = client.recvfrom(BUFFER_SIZE)
+            message = data.decode()
             print(message)
-        except (ConnectionResetError, ConnectionAbortedError):
-            print("⚠️ Connection lost. Server might be offline.")
-            break
         except Exception as e:
-            print(f"⚠️ Unexpected error: {e}")
+            print(f"⚠️ Connection error: {e}")
             break
-    client.close()
-    sys.exit()
-
 
 def main():
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        client.connect((HOST, PORT))
-    except Exception as e:
-        print("❌ Connection failed! Unable to reach the server.")
-        print(f"[Technical Error] {e}")
-        time.sleep(2)
-        return
-
-    threading.Thread(target=receive_messages, args=(client,), daemon=True).start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server_addr = (SERVER_IP, SERVER_PORT)
 
     try:
+        # Initiate connection
+        client.sendto("HELLO".encode(), server_addr)
+        threading.Thread(target=receive_messages, args=(client,), daemon=True).start()
+
         while True:
             msg = input()
-            if msg.lower() == 'exit':
-                print("👋 Exiting the quiz. Goodbye!")
+            if msg.lower() == "exit":
+                print("👋 Exiting quiz. Goodbye!")
                 break
-            client.sendall(msg.encode())
-    except (KeyboardInterrupt, EOFError):
+            client.sendto(msg.encode(), server_addr)
+
+    except KeyboardInterrupt:
         print("\n👋 Client closed manually.")
     except Exception as e:
-        print(f"⚠️ Unexpected error: {e}")
+        print(f"❌ Unexpected error: {e}")
     finally:
         client.close()
-
+        sys.exit()
 
 if __name__ == "__main__":
     main()
