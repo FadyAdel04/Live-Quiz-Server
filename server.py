@@ -7,8 +7,9 @@ import logging
 import os
 import queue
 import random
+from exceptions import QuizError, NetworkError, DataFormatError, ResourceLoadError, AuthError
 
-HOST = '0.0.0.0'
+HOST = '127.0.0.1'
 PORT = 8080
 QUESTION_TIME = 15
 ACK_TIMEOUT = 2
@@ -29,6 +30,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+# Clear server log on startup
+try:
+    open(os.path.join(LOG_DIR, "server.log"), 'w').close()
+except Exception:
+    pass
+
 def load_users():
     """Load registered users from users.json"""
     try:
@@ -46,17 +53,22 @@ def send_json(sock, data, addr):
     try:
         payload = json.dumps(data).encode()
         sock.sendto(payload, addr)
-    except Exception as e:
-        logging.exception("Failed to send to %s: %s", addr, e)
+    except (OSError, TimeoutError) as e:
+        raise NetworkError(f"Failed to send to {addr}: {e}") from e
+    except (TypeError, ValueError, json.JSONDecodeError) as e:
+        raise DataFormatError(f"Failed to serialize message for {addr}: {e}") from e
 
 def recv_loop(sock):
     """Receive UDP packets and dispatch to per-client queues."""
     while True:
         try:
-            data, addr = sock.recvfrom(4096)
+            try:
+                data, addr = sock.recvfrom(4096)
+            except OSError as e:
+                raise NetworkError(f"recvfrom failed: {e}") from e
             try:
                 msg = json.loads(data.decode())
-            except Exception:
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
                 logging.exception("Malformed JSON from %s", addr)
                 continue
 
@@ -74,6 +86,8 @@ def recv_loop(sock):
                 if user and user in clients:
                     clients[user]['last_seen'] = time.time()
 
+        except QuizError as e:
+            logging.exception("Quiz error in recv_loop: %s", e)
         except Exception as e:
             logging.exception("Error in recv_loop: %s", e)
             time.sleep(0.1)
@@ -137,6 +151,8 @@ def handle_auth_message(sock, msg):
         ack = {'type': 'auth_ack', 'status': 'fail', 'seq': seq}
         send_with_ack(sock, ack, addr, expected_ack_type='ack', seq=seq)
         logging.info("Failed auth for %s from %s", username, addr)
+        # Optional: raise an auth error for upstream handlers if needed
+        # raise AuthError(f"Invalid credentials for user {username}")
 
 def quiz_session(sock, username):
     """Per-client quiz flow: send questions, wait for answers via client's queue."""
@@ -153,9 +169,12 @@ def quiz_session(sock, username):
         try:
             with open('questions.json', 'r') as f:
                 questions = json.load(f)
+        except FileNotFoundError as e:
+            raise ResourceLoadError(f"questions.json not found: {e}") from e
+        except json.JSONDecodeError as e:
+            raise DataFormatError(f"questions.json is invalid JSON: {e}") from e
         except Exception as e:
-            logging.exception("Failed to load questions.json: %s", e)
-            return
+            raise ResourceLoadError(f"Failed to load questions.json: {e}") from e
 
         score = 0
         for idx, question in enumerate(questions, start=1):
@@ -184,7 +203,10 @@ def quiz_session(sock, username):
                     answer = incoming.get('answer')
                     # send answer ACK to client
                     ack = {'type': 'ack', 'seq': seq}
-                    send_json(sock, ack, addr)
+                    try:
+                        send_json(sock, ack, addr)
+                    except QuizError as e:
+                        logging.exception("Failed to send ACK to %s: %s", addr, e)
                     break
                 else:
                     # ignore unrelated messages here
@@ -196,7 +218,10 @@ def quiz_session(sock, username):
                 res_msg = {'type': 'result', 'seq': seq, 'status': 'correct'}
             else:
                 res_msg = {'type': 'result', 'seq': seq, 'status': 'wrong', 'correct': question.get('answer')}
-            send_json(sock, res_msg, addr)
+            try:
+                send_json(sock, res_msg, addr)
+            except QuizError as e:
+                logging.exception("Failed to send result to %s: %s", addr, e)
 
         # save score and broadcast leaderboard
         with lock:
@@ -208,11 +233,13 @@ def quiz_session(sock, username):
         for a in targets:
             try:
                 send_json(sock, lb_msg, a)
-            except Exception:
-                logging.exception("Failed to send leaderboard to %s", a)
+            except QuizError as e:
+                logging.exception("Failed to send leaderboard to %s: %s", a, e)
 
         logging.info("User %s finished quiz with score %s", username, score)
 
+    except QuizError as e:
+        logging.exception("Quiz error in quiz_session for %s: %s", username, e)
     except Exception as e:
         logging.exception("Error in quiz_session for %s: %s", username, e)
     finally:
@@ -228,10 +255,13 @@ def start_server():
     """Start the UDP quiz server."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((HOST, PORT))
+        try:
+            sock.bind((HOST, PORT))
+        except OSError as e:
+            raise NetworkError(f"Failed to bind {HOST}:{PORT}: {e}") from e
         logging.info("Server started on %s:%s", HOST, PORT)
         print(f"✅ Server started on {HOST}:{PORT}")
-    except Exception as e:
+    except QuizError as e:
         logging.exception("Failed to start server: %s", e)
         return
 
@@ -266,6 +296,8 @@ def start_server():
         except KeyboardInterrupt:
             print("\n🛑 Server shutting down...")
             break
+        except QuizError as e:
+            logging.exception("Quiz error in main loop: %s", e)
         except Exception as e:
             logging.exception("Unexpected server error in main loop: %s", e)
             time.sleep(1)
