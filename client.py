@@ -24,6 +24,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+# Clear client log on startup
+try:
+    open(os.path.join(LOG_DIR, "client.log"), 'w').close()
+except Exception:
+    pass
+
 recv_queue = queue.Queue()
 stop_event = threading.Event()
 

@@ -30,6 +30,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+# Clear server log on startup
+try:
+    open(os.path.join(LOG_DIR, "server.log"), 'w').close()
+except Exception:
+    pass
+
 def load_users():
     """Load registered users from users.json"""
     try:
