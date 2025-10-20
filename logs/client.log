@@ -1,0 +1,36 @@
+2025-10-20 03:31:10,406 [ERROR] Listener error: timed out
+Traceback (most recent call last):
+  File "d:\0)Projects\fatomaa\Live-Quiz-Server\client.py", line 41, in listener
+    data, _ = sock.recvfrom(4096)
+              ~~~~~~~~~~~~~^^^^^^
+TimeoutError: timed out
+2025-10-20 03:31:35,348 [ERROR] Listener error: timed out
+Traceback (most recent call last):
+  File "d:\0)Projects\fatomaa\Live-Quiz-Server\client.py", line 41, in listener
+    data, _ = sock.recvfrom(4096)
+              ~~~~~~~~~~~~~^^^^^^
+TimeoutError: timed out
+2025-10-20 03:31:40,925 [ERROR] Listener error: timed out
+Traceback (most recent call last):
+  File "d:\0)Projects\fatomaa\Live-Quiz-Server\client.py", line 41, in listener
+    data, _ = sock.recvfrom(4096)
+              ~~~~~~~~~~~~~^^^^^^
+TimeoutError: timed out
+2025-10-20 03:31:46,506 [ERROR] Listener error: timed out
+Traceback (most recent call last):
+  File "d:\0)Projects\fatomaa\Live-Quiz-Server\client.py", line 41, in listener
+    data, _ = sock.recvfrom(4096)
+              ~~~~~~~~~~~~~^^^^^^
+TimeoutError: timed out
+2025-10-20 03:31:52,082 [ERROR] Listener error: timed out
+Traceback (most recent call last):
+  File "d:\0)Projects\fatomaa\Live-Quiz-Server\client.py", line 41, in listener
+    data, _ = sock.recvfrom(4096)
+              ~~~~~~~~~~~~~^^^^^^
+TimeoutError: timed out
+2025-10-20 03:31:57,638 [ERROR] Listener error: timed out
+Traceback (most recent call last):
+  File "d:\0)Projects\fatomaa\Live-Quiz-Server\client.py", line 41, in listener
+    data, _ = sock.recvfrom(4096)
+              ~~~~~~~~~~~~~^^^^^^
+TimeoutError: timed out

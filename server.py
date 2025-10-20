@@ -3,15 +3,31 @@ import threading
 import json
 import time
 import traceback
+import logging
+import os
+import queue
+import random
 
 HOST = '0.0.0.0'
 PORT = 8080
 QUESTION_TIME = 15
+ACK_TIMEOUT = 2
+ACK_RETRIES = 4
 
-clients = {}
+clients = {}           # username -> {'addr': addr, 'queue': Queue, 'last_seen': ts}
+addr_to_user = {}      # addr -> username
 scores = {}
 lock = threading.Lock()
+msg_queues = {}        # addr -> Queue()
 
+# Setup logging
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    filename=os.path.join(LOG_DIR, "server.log"),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 def load_users():
     """Load registered users from users.json"""
@@ -19,154 +35,242 @@ def load_users():
         with open('users.json', 'r') as f:
             return json.load(f)
     except FileNotFoundError:
-        print("❌ Error: users.json not found.")
+        logging.warning("users.json not found; continuing with empty users.")
         return {}
     except json.JSONDecodeError:
-        print("❌ Error: users.json file is not valid JSON.")
+        logging.error("users.json not valid JSON; continuing with empty users.")
         return {}
 
-
-def authenticate_user(conn):
-    """Ask for username/password and validate."""
-    users = load_users()
-
-    for _ in range(3):
-        try:
-            conn.sendall("Enter your username: ".encode())
-            username = conn.recv(1024).decode().strip()
-
-            conn.sendall("Enter your password: ".encode())
-            password = conn.recv(1024).decode().strip()
-        except Exception as e:
-            print(f"⚠️ Connection error during authentication: {e}")
-            send_error_with_delay(conn, f"Connection error during authentication: {e}")
-            return None
-
-        if username in users and users[username] == password:
-            conn.sendall(f"✅ Login successful! Welcome {username}.\n".encode())
-            return username
-        else:
-            conn.sendall("❌ Invalid credentials. Try again.\n".encode())
-
-    conn.sendall("🚫 Too many failed attempts. Connection closed.\n".encode())
-    conn.close()
-    return None
-
-
-def broadcast(message):
-    """Send a message to all connected clients."""
-    for conn in list(clients.values()):
-        try:
-            conn.sendall(message.encode())
-        except Exception:
-            # Remove disconnected clients
-            for user, c in clients.items():
-                if c == conn:
-                    print(f"⚠️ Disconnected client removed: {user}")
-                    del clients[user]
-                    break
-
-
-def send_error_with_delay(conn, message):
-    """Wait 3 seconds then send error log message to client."""
-    def delayed_send():
-        time.sleep(3)
-        try:
-            conn.sendall(f"\n⚠️ Error log: {message}\n".encode())
-        except:
-            pass
-    threading.Thread(target=delayed_send, daemon=True).start()
-
-
-def handle_client(conn, addr, username):
-    """Handle individual client session."""
+def send_json(sock, data, addr):
+    """Send a JSON message over UDP."""
     try:
-        conn.sendall("Welcome to the quiz!\n".encode())
-        time.sleep(1)
-
-        with open('questions.json', 'r') as f:
-            questions = json.load(f)
-
-        score = 0
-        for q in questions:
-            question_text = (
-                f"\n{q['question']}\n"
-                + "\n".join(q["options"])
-                + f"\nYou have {QUESTION_TIME} seconds. Enter A/B/C/D: "
-            )
-            conn.sendall(question_text.encode())
-
-            conn.settimeout(QUESTION_TIME)
-            try:
-                answer = conn.recv(1024).decode().strip().upper()
-            except socket.timeout:
-                conn.sendall("⏰ Time’s up!\n".encode())
-                answer = None
-            except Exception as e:
-                conn.sendall("⚠️ Error receiving your answer.\n".encode())
-                send_error_with_delay(conn, f"Error receiving answer: {e}")
-                answer = None
-
-            if answer == q['answer']:
-                score += 1
-                conn.sendall("✅ Correct!\n".encode())
-            else:
-                conn.sendall(f"❌ Wrong! Correct answer: {q['answer']}\n".encode())
-
-        with lock:
-            scores[username] = score
-
-        conn.sendall(f"\n🏁 Your total score: {score}\n".encode())
-
-        # Send updated leaderboard
-        leaderboard = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        leaderboard_text = "\n🏆 Leaderboard:\n" + "\n".join([f"{u}: {s}" for u, s in leaderboard])
-        broadcast(leaderboard_text)
-
+        payload = json.dumps(data).encode()
+        sock.sendto(payload, addr)
     except Exception as e:
-        print(f"❌ Error handling client {username}: {e}")
-        traceback.print_exc()
-        send_error_with_delay(conn, f"Server error: {e}")
-    finally:
-        conn.close()
-        with lock:
-            if username in clients:
-                del clients[username]
-        print(f"🔌 {username} disconnected.")
+        logging.exception("Failed to send to %s: %s", addr, e)
 
-
-def start_server():
-    """Start the TCP quiz server."""
-    try:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.bind((HOST, PORT))
-        server.listen()
-        print(f"✅ Server started on {HOST}:{PORT}")
-    except Exception as e:
-        print(f"❌ Failed to start server: {e}")
-        return
-
+def recv_loop(sock):
+    """Receive UDP packets and dispatch to per-client queues."""
     while True:
         try:
-            conn, addr = server.accept()
-            print(f"📥 Connection from {addr}")
-            username = authenticate_user(conn)
-            if not username:
+            data, addr = sock.recvfrom(4096)
+            try:
+                msg = json.loads(data.decode())
+            except Exception:
+                logging.exception("Malformed JSON from %s", addr)
                 continue
 
-            clients[username] = conn
-            print(f"👤 {username} connected.")
-            threading.Thread(target=handle_client, args=(conn, addr, username), daemon=True).start()
+            # update or create queue for addr
+            q = msg_queues.get(addr)
+            if not q:
+                q = queue.Queue()
+                msg_queues[addr] = q
 
+            msg['_addr'] = addr
+            q.put(msg)
+            # update last seen if known
+            with lock:
+                user = addr_to_user.get(addr)
+                if user and user in clients:
+                    clients[user]['last_seen'] = time.time()
+
+        except Exception as e:
+            logging.exception("Error in recv_loop: %s", e)
+            time.sleep(0.1)
+
+def send_with_ack(sock, msg, addr, expected_ack_type, seq, timeout=ACK_TIMEOUT, retries=ACK_RETRIES):
+    """Send msg and wait for an ACK of expected type and matching seq from addr."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            send_json(sock, msg, addr)
+            # wait for ack in the addr's queue
+            q = msg_queues.get(addr)
+            if not q:
+                q = queue.Queue()
+                msg_queues[addr] = q
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    incoming = q.get(timeout=deadline - time.time())
+                except queue.Empty:
+                    break
+                if incoming.get('type') == expected_ack_type and incoming.get('seq') == seq:
+                    return True
+                else:
+                    # not the ack we expected; push back for other handlers
+                    # small best-effort: ignore or stash if needed
+                    continue
+        except Exception as e:
+            last_err = e
+            logging.exception("send_with_ack exception to %s: %s", addr, e)
+        time.sleep(0.5 * (attempt + 1))
+    logging.warning("No ACK received from %s for seq %s after %d tries. Last error: %s", addr, seq, retries, last_err)
+    return False
+
+def handle_auth_message(sock, msg):
+    """Handle incoming auth message, reply with auth_ack and start session."""
+    addr = msg.get('_addr')
+    username = msg.get('username')
+    password = msg.get('password')
+    seq = msg.get('seq', random.randint(1, 1_000_000))
+    users = load_users()
+
+    if username in users and users[username] == password:
+        # create client entry
+        with lock:
+            clients[username] = {
+                'addr': addr,
+                'queue': msg_queues.get(addr, queue.Queue()),
+                'last_seen': time.time()
+            }
+            addr_to_user[addr] = username
+            msg_queues[addr] = clients[username]['queue']
+
+        ack = {'type': 'auth_ack', 'status': 'ok', 'seq': seq}
+        send_with_ack(sock, ack, addr, expected_ack_type='ack', seq=seq)
+
+        logging.info("User %s authenticated from %s", username, addr)
+        # start quiz session thread
+        threading.Thread(target=quiz_session, args=(sock, username), daemon=True).start()
+    else:
+        ack = {'type': 'auth_ack', 'status': 'fail', 'seq': seq}
+        send_with_ack(sock, ack, addr, expected_ack_type='ack', seq=seq)
+        logging.info("Failed auth for %s from %s", username, addr)
+
+def quiz_session(sock, username):
+    """Per-client quiz flow: send questions, wait for answers via client's queue."""
+    try:
+        with lock:
+            client_info = clients.get(username)
+        if not client_info:
+            logging.warning("quiz_session started but client not found: %s", username)
+            return
+        addr = client_info['addr']
+        q = client_info['queue']
+
+        # load questions
+        try:
+            with open('questions.json', 'r') as f:
+                questions = json.load(f)
+        except Exception as e:
+            logging.exception("Failed to load questions.json: %s", e)
+            return
+
+        score = 0
+        for idx, question in enumerate(questions, start=1):
+            seq = random.randint(1, 1_000_000)
+            msg = {
+                'type': 'question',
+                'seq': seq,
+                'index': idx,
+                'question': question['question'],
+                'options': question['options'],
+                'time': QUESTION_TIME
+            }
+            ok = send_with_ack(sock, msg, addr, expected_ack_type='ack', seq=seq)
+            if not ok:
+                logging.warning("Client %s did not ACK question %s; continuing.", username, seq)
+
+            # wait for answer or timeout
+            answer = None
+            deadline = time.time() + QUESTION_TIME
+            while time.time() < deadline:
+                try:
+                    incoming = q.get(timeout=deadline - time.time())
+                except queue.Empty:
+                    break
+                if incoming.get('type') == 'answer' and incoming.get('seq') == seq:
+                    answer = incoming.get('answer')
+                    # send answer ACK to client
+                    ack = {'type': 'ack', 'seq': seq}
+                    send_json(sock, ack, addr)
+                    break
+                else:
+                    # ignore unrelated messages here
+                    continue
+
+            correct = (answer == question.get('answer'))
+            if correct:
+                score += 1
+                res_msg = {'type': 'result', 'seq': seq, 'status': 'correct'}
+            else:
+                res_msg = {'type': 'result', 'seq': seq, 'status': 'wrong', 'correct': question.get('answer')}
+            send_json(sock, res_msg, addr)
+
+        # save score and broadcast leaderboard
+        with lock:
+            scores[username] = score
+            leaderboard = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            targets = [info['addr'] for info in clients.values()]
+
+        lb_msg = {'type': 'leaderboard', 'leaderboard': leaderboard}
+        for a in targets:
+            try:
+                send_json(sock, lb_msg, a)
+            except Exception:
+                logging.exception("Failed to send leaderboard to %s", a)
+
+        logging.info("User %s finished quiz with score %s", username, score)
+
+    except Exception as e:
+        logging.exception("Error in quiz_session for %s: %s", username, e)
+    finally:
+        # clean up client state but keep scores
+        with lock:
+            info = clients.pop(username, None)
+            if info:
+                addr_to_user.pop(info['addr'], None)
+                msg_queues.pop(info['addr'], None)
+        logging.info("Cleaned up session for %s", username)
+
+def start_server():
+    """Start the UDP quiz server."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((HOST, PORT))
+        logging.info("Server started on %s:%s", HOST, PORT)
+        print(f"✅ Server started on {HOST}:{PORT}")
+    except Exception as e:
+        logging.exception("Failed to start server: %s", e)
+        return
+
+    # start receiver thread
+    threading.Thread(target=recv_loop, args=(sock,), daemon=True).start()
+
+    # main dispatch loop: listen to new messages in global queues and handle auths
+    while True:
+        try:
+            # scan all queues for auth messages (non-blocking approach)
+            for addr, q in list(msg_queues.items()):
+                try:
+                    while True:
+                        msg = q.get_nowait()
+                        msg['_addr'] = addr
+                        mtype = msg.get('type')
+                        if mtype == 'auth':
+                            handle_auth_message(sock, msg)
+                        else:
+                            # Other messages go to per-client queue if bound
+                            user = addr_to_user.get(addr)
+                            if user and user in clients:
+                                # already in client's queue; put back
+                                clients[user]['queue'].put(msg)
+                            else:
+                                # keep it in the addr queue for when client authenticates
+                                q.put(msg)
+                                break
+                except queue.Empty:
+                    continue
+            time.sleep(0.1)
         except KeyboardInterrupt:
             print("\n🛑 Server shutting down...")
             break
         except Exception as e:
-            print(f"⚠️ Unexpected server error: {e}")
-            traceback.print_exc()
+            logging.exception("Unexpected server error in main loop: %s", e)
+            time.sleep(1)
 
-    server.close()
-
+    sock.close()
 
 if __name__ == "__main__":
     start_server()
