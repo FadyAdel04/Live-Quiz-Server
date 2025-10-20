@@ -7,8 +7,9 @@ import queue
 import random
 import logging
 import os
+from exceptions import QuizError, NetworkError, DataFormatError, AuthError
 
-HOST = '192.168.1.18'  # Replace with your server IP
+HOST = '127.0.0.1'  # Replace with your server IP
 PORT = 8080
 ACK_TIMEOUT = 2
 ACK_RETRIES = 4
@@ -23,28 +24,49 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+# Clear client log on startup
+try:
+    open(os.path.join(LOG_DIR, "client.log"), 'w').close()
+except Exception:
+    pass
+
 recv_queue = queue.Queue()
 stop_event = threading.Event()
 
 
 def send_json(sock, data, addr):
     try:
-        sock.sendto(json.dumps(data).encode(), addr)
-    except Exception as e:
-        logging.exception("Failed to send: %s", e)
+        try:
+            payload = json.dumps(data).encode()
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            raise DataFormatError(f"Failed to serialize message: {e}") from e
+        try:
+            sock.sendto(payload, addr)
+        except OSError as e:
+            raise NetworkError(f"Failed to send to {addr}: {e}") from e
+    except QuizError as e:
+        logging.exception("Send error: %s", e)
 
 
 def listener(sock):
     """Listen for server messages and enqueue them."""
     while not stop_event.is_set():
         try:
-            data, _ = sock.recvfrom(4096)
+            try:
+                data, _ = sock.recvfrom(4096)
+            except OSError as e:
+                # On Windows UDP, 10054 can indicate server port unreachable (server stopped)
+                if getattr(e, 'errno', None) == 10054:
+                    raise NetworkError("Server appears to be offline or stopped (ICMP port unreachable).") from e
+                raise NetworkError(f"recvfrom failed: {e}") from e
             try:
                 msg = json.loads(data.decode())
-            except Exception:
-                logging.exception("Malformed JSON from server")
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                logging.exception("Malformed JSON from server: %s", e)
                 continue
             recv_queue.put(msg)
+        except QuizError as e:
+            logging.exception("Listener quiz error: %s", e)
         except Exception as e:
             logging.exception("Listener error: %s", e)
             time.sleep(0.5)
@@ -166,8 +188,10 @@ def authenticate_and_run(username, password):
                     recv_queue.put(incoming)
                     break
 
-            if not auth_response or auth_response.get('status') != 'ok':
-                raise ConnectionError("Authentication failed or no response from server.")
+            if not auth_response:
+                raise AuthError("No authentication response from server.")
+            if auth_response.get('status') != 'ok':
+                raise AuthError("Authentication failed.")
 
             print(f"✅ Authenticated as {username}. Waiting for quiz...")
             # start message processor
@@ -181,9 +205,46 @@ def authenticate_and_run(username, password):
                 if stop_event.is_set():
                     break
 
+        except AuthError as e:
+            logging.exception("Authentication error: %s", e)
+            print("⚠️ Authentication error:", e)
+            # Give the user another chance to login with new credentials immediately
+            try:
+                while True:
+                    recv_queue.get_nowait()
+            except queue.Empty:
+                pass
+            backoff_idx = 0
+            print("Please try logging in again.")
+            username = input("Username: ").strip()
+            password = input("Password: ").strip()
+            continue
+        except QuizError as e:
+            logging.exception("Quiz error: %s", e)
+            print("⚠️ Quiz error:", e)
+            backoff = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF)-1)]
+            backoff_idx += 1
+            print(f"Reconnecting in {backoff} seconds...")
+            time.sleep(backoff)
+            try:
+                while True:
+                    recv_queue.get_nowait()
+            except queue.Empty:
+                pass
+            continue
         except Exception as e:
             logging.exception("Connection/auth error: %s", e)
             print("⚠️ Connection/auth error:", e)
+            backoff = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF)-1)]
+            backoff_idx += 1
+            print(f"Reconnecting in {backoff} seconds...")
+            time.sleep(backoff)
+            try:
+                while True:
+                    recv_queue.get_nowait()
+            except queue.Empty:
+                pass
+            continue
             backoff = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF)-1)]
             backoff_idx += 1
             print(f"Reconnecting in {backoff} seconds...")
