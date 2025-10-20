@@ -3,3 +3,8 @@
 2025-10-20 03:31:05,355 [INFO] User youssef authenticated from ('192.168.1.18', 62011)
 2025-10-20 03:31:30,269 [INFO] User youssef finished quiz with score 6
 2025-10-20 03:31:30,270 [INFO] Cleaned up session for youssef
+2025-10-20 03:37:20,153 [INFO] Server started on 0.0.0.0:8080
+2025-10-20 03:37:47,887 [WARNING] No ACK received from ('192.168.1.18', 52912) for seq 805953 after 4 tries. Last error: None
+2025-10-20 03:37:47,888 [INFO] User youssef authenticated from ('192.168.1.18', 52912)
+2025-10-20 03:37:56,720 [INFO] User youssef finished quiz with score 5
+2025-10-20 03:37:56,720 [INFO] Cleaned up session for youssef
