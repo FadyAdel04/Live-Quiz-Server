@@ -1,0 +1,9 @@
+# Python Dependencies for Quiz Server with SSL Support
+
+# Optional: Required for automatic SSL certificate generation
+# If you don't install this, you'll need to generate certificates manually
+cryptography>=41.0.0
+
+# Note: All other dependencies (socket, threading, json, time, logging, etc.)
+# are part of Python's standard library and don't need to be installed.
+

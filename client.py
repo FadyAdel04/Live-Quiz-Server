@@ -7,10 +7,13 @@ import queue
 import random
 import logging
 import os
+import ssl
 from exceptions import QuizError, NetworkError, DataFormatError, AuthError
 
 HOST = '127.0.0.1'  # Replace with your server IP
 PORT = 8080
+USE_SSL = True
+SSL_CERT_FILE = 'ssl/server.crt'  # Path to server certificate (for verification)
 ACK_TIMEOUT = 2
 ACK_RETRIES = 4
 RECONNECT_BACKOFF = [1, 2, 5, 10]
@@ -34,50 +37,60 @@ recv_queue = queue.Queue()
 stop_event = threading.Event()
 
 
-def send_json(sock, data, addr):
+def send_json(sock, data):
     try:
         try:
-            payload = json.dumps(data).encode()
+            payload = json.dumps(data).encode() + b'\n'
         except (TypeError, ValueError, json.JSONDecodeError) as e:
             raise DataFormatError(f"Failed to serialize message: {e}") from e
         try:
-            sock.sendto(payload, addr)
-        except OSError as e:
-            raise NetworkError(f"Failed to send to {addr}: {e}") from e
+            sock.sendall(payload)
+        except (OSError, BrokenPipeError, ConnectionResetError) as e:
+            raise NetworkError(f"Failed to send: {e}") from e
     except QuizError as e:
         logging.exception("Send error: %s", e)
 
 
 def listener(sock):
     """Listen for server messages and enqueue them."""
+    buffer = b''
     while not stop_event.is_set():
         try:
             try:
-                data, _ = sock.recvfrom(4096)
-            except OSError as e:
-                # On Windows UDP, 10054 can indicate server port unreachable (server stopped)
-                if getattr(e, 'errno', None) == 10054:
-                    raise NetworkError("Server appears to be offline or stopped (ICMP port unreachable).") from e
-                raise NetworkError(f"recvfrom failed: {e}") from e
-            try:
-                msg = json.loads(data.decode())
-            except (UnicodeDecodeError, json.JSONDecodeError) as e:
-                logging.exception("Malformed JSON from server: %s", e)
-                continue
-            recv_queue.put(msg)
+                data = sock.recv(4096)
+                if not data:
+                    logging.info("Server closed connection")
+                    break
+                buffer += data
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line.decode())
+                    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                        logging.exception("Malformed JSON from server: %s", e)
+                        continue
+                    recv_queue.put(msg)
+            except (OSError, ConnectionResetError, BrokenPipeError) as e:
+                logging.info("Connection closed: %s", e)
+                break
+            except Exception as e:
+                raise NetworkError(f"recv failed: {e}") from e
         except QuizError as e:
             logging.exception("Listener quiz error: %s", e)
         except Exception as e:
             logging.exception("Listener error: %s", e)
             time.sleep(0.5)
+            break
 
 
-def send_with_ack(sock, addr, msg, expected_ack_type, seq, timeout=ACK_TIMEOUT, retries=ACK_RETRIES):
+def send_with_ack(sock, msg, expected_ack_type, seq, timeout=ACK_TIMEOUT, retries=ACK_RETRIES):
     """Send message and wait for a matching ACK on recv_queue."""
     last_err = None
     for attempt in range(retries):
         try:
-            send_json(sock, msg, addr)
+            send_json(sock, msg)
             deadline = time.time() + timeout
             while time.time() < deadline:
                 try:
@@ -116,7 +129,7 @@ def process_messages(sock):
 
             # Send ACK for question receipt
             ack = {'type': 'ack', 'seq': seq}
-            send_json(sock, ack, (HOST, PORT))
+            send_json(sock, ack)
 
             # read answer in another thread to avoid blocking other messages
             answer_holder = {'answer': None}
@@ -133,7 +146,7 @@ def process_messages(sock):
             t.join(timeout=msg.get('time', 15))
             ans = answer_holder['answer']
             answer_msg = {'type': 'answer', 'seq': seq, 'answer': ans}
-            send_json(sock, answer_msg, (HOST, PORT))
+            send_json(sock, answer_msg)
 
         elif mtype == 'result':
             if msg.get('status') == 'correct':
@@ -158,36 +171,75 @@ def authenticate_and_run(username, password):
     """Authenticate to server with retries and run listener + processor."""
     backoff_idx = 0
     while True:
+        sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(5)
-            addr = (HOST, PORT)
-
+            # Create TCP socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            
+            # Connect to server
+            try:
+                sock.connect((HOST, PORT))
+            except (OSError, ConnectionRefusedError) as e:
+                raise NetworkError(f"Failed to connect to {HOST}:{PORT}: {e}") from e
+            
+            # Wrap with SSL if enabled
+            if USE_SSL:
+                try:
+                    # Create SSL context
+                    ssl_context = ssl.create_default_context()
+                    # For self-signed certificates, disable verification (for development only)
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    
+                    # If certificate file exists, use it for verification
+                    if os.path.exists(SSL_CERT_FILE):
+                        try:
+                            ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SSL_CERT_FILE)
+                            ssl_context.check_hostname = False
+                        except:
+                            pass
+                    
+                    sock = ssl_context.wrap_socket(sock, server_hostname=HOST)
+                    logging.info("SSL connection established")
+                except Exception as e:
+                    logging.warning("SSL handshake failed, continuing without SSL: %s", e)
+            
             # start listener thread
-            threading.Thread(target=listener, args=(sock,), daemon=True).start()
+            listener_thread = threading.Thread(target=listener, args=(sock,), daemon=True)
+            listener_thread.start()
+            
+            # Give listener thread a moment to start
+            time.sleep(0.1)
 
             seq = random.randint(1, 1_000_000)
             auth_msg = {'type': 'auth', 'username': username, 'password': password, 'seq': seq}
-            ok = send_with_ack(sock, addr, auth_msg, expected_ack_type='auth_ack', seq=seq)
-            if not ok:
-                raise ConnectionError("Auth ACK not received")
-
-            # server should have replied; but we still wait for final auth_ack content
-            # check the auth_ack status
+            
+            # Send auth message and wait for auth_ack response
+            logging.info("Sending auth message with seq %s", seq)
+            send_json(sock, auth_msg)
+            
+            # Wait for auth_ack response
             auth_response = None
-            deadline = time.time() + 3
+            deadline = time.time() + 5  # 5 second timeout
             while time.time() < deadline:
                 try:
-                    incoming = recv_queue.get(timeout=deadline - time.time())
+                    timeout = max(0.1, deadline - time.time())
+                    incoming = recv_queue.get(timeout=timeout)
+                    logging.debug("Received message type: %s, seq: %s (waiting for auth_ack, seq: %s)", 
+                                incoming.get('type'), incoming.get('seq'), seq)
                 except queue.Empty:
+                    logging.debug("Timeout waiting for auth_ack, time remaining: %.2f", deadline - time.time())
                     break
                 if incoming.get('type') == 'auth_ack' and incoming.get('seq') == seq:
                     auth_response = incoming
+                    logging.info("Received auth_ack with status: %s", incoming.get('status'))
                     break
                 else:
+                    # Put back for other handlers, continue looking
                     recv_queue.put(incoming)
-                    break
-
+                    continue
+            
             if not auth_response:
                 raise AuthError("No authentication response from server.")
             if auth_response.get('status') != 'ok':
@@ -203,6 +255,9 @@ def authenticate_and_run(username, password):
                 time.sleep(1)
                 # simple heartbeat: if socket or listener thread died, break and reconnect
                 if stop_event.is_set():
+                    break
+                if not listener_thread.is_alive():
+                    logging.info("Listener thread died, reconnecting...")
                     break
 
         except AuthError as e:
@@ -257,10 +312,11 @@ def authenticate_and_run(username, password):
                 pass
             continue
         finally:
-            try:
-                sock.close()
-            except:
-                pass
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
 
 
 def main():

@@ -16,6 +16,3 @@ class DataFormatError(QuizError):
 
 class ResourceLoadError(QuizError):
     """Raised when required resources (e.g., questions/users) fail to load."""
-
-
-
