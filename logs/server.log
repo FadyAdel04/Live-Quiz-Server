@@ -1,10 +1,12 @@
-2025-10-20 03:30:34,419 [INFO] Server started on 0.0.0.0:8080
-2025-10-20 03:31:05,355 [WARNING] No ACK received from ('192.168.1.18', 62011) for seq 429535 after 4 tries. Last error: None
-2025-10-20 03:31:05,355 [INFO] User youssef authenticated from ('192.168.1.18', 62011)
-2025-10-20 03:31:30,269 [INFO] User youssef finished quiz with score 6
-2025-10-20 03:31:30,270 [INFO] Cleaned up session for youssef
-2025-10-20 03:37:20,153 [INFO] Server started on 0.0.0.0:8080
-2025-10-20 03:37:47,887 [WARNING] No ACK received from ('192.168.1.18', 52912) for seq 805953 after 4 tries. Last error: None
-2025-10-20 03:37:47,888 [INFO] User youssef authenticated from ('192.168.1.18', 52912)
-2025-10-20 03:37:56,720 [INFO] User youssef finished quiz with score 5
-2025-10-20 03:37:56,720 [INFO] Cleaned up session for youssef
+2025-11-09 22:36:30,961 [INFO] WebSocket server starting on ws://127.0.0.1:8080 (Apache handles SSL)
+2025-11-09 22:36:30,963 [ERROR] Unexpected server error: [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8080): only one usage of each socket address (protocol/network address/port) is normally permitted
+Traceback (most recent call last):
+  File "D:\0)Projects\fatomaa\Live-Quiz-Server\server.py", line 287, in start_server
+    async with serve(handle_client, HOST, PORT, ssl=ssl_context):
+  File "C:\Users\MSI\AppData\Roaming\Python\Python310\site-packages\websockets\legacy\server.py", line 1105, in __aenter__
+    return await self
+  File "C:\Users\MSI\AppData\Roaming\Python\Python310\site-packages\websockets\legacy\server.py", line 1123, in __await_impl__
+    server = await self._create_server()
+  File "C:\Program Files\Python310\lib\asyncio\base_events.py", line 1519, in create_server
+    raise OSError(err.errno, 'error while attempting '
+OSError: [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8080): only one usage of each socket address (protocol/network address/port) is normally permitted
