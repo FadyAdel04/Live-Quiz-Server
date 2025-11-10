@@ -1,12 +1,17 @@
-# Python Dependencies for Quiz Server with SSL Support
+# Python Dependencies for Quiz Server with HTTP/HTTPS Support
+
+# FastAPI web framework for HTTP server
+fastapi>=0.104.0
+
+# ASGI server for running FastAPI
+uvicorn[standard]>=0.24.0
+
+# HTTP client library for the client application
+requests>=2.31.0
 
 # Optional: Required for automatic SSL certificate generation
 # If you don't install this, you'll need to generate certificates manually
 cryptography>=41.0.0
 
-# WebSocket support for Apache integration
-websockets>=12.0
-
-# Note: All other dependencies (socket, threading, json, time, logging, etc.)
+# Note: All other dependencies (json, time, logging, os, etc.)
 # are part of Python's standard library and don't need to be installed.
-

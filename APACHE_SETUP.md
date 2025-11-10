@@ -1,18 +1,19 @@
 # Apache Setup Guide for Quiz Server
 
-This guide explains how to run the Quiz Server behind Apache using WebSocket proxying.
+This guide explains how to run the Quiz Server behind Apache using HTTP/HTTPS reverse proxy.
 
 ## Overview
 
-The Quiz Server has been converted to use WebSocket protocol, which allows it to be proxied through Apache. Apache handles SSL/TLS termination, while the Python server runs on localhost without SSL.
+The Quiz Server uses HTTP/HTTPS protocol with REST API endpoints and Server-Sent Events (SSE) for real-time updates. Apache handles SSL/TLS termination, while the Python server runs on localhost without SSL.
 
 ## Prerequisites
 
 1. Apache 2.4+ with the following modules enabled:
    - `mod_ssl` (for HTTPS)
    - `mod_proxy` (for reverse proxy)
-   - `mod_proxy_wstunnel` (for WebSocket support)
-   - `mod_rewrite` (for WebSocket detection)
+   - `mod_proxy_http` (for HTTP proxy support)
+   - `mod_headers` (for setting headers)
+   - `mod_rewrite` (for HTTP to HTTPS redirect)
 
 2. Python dependencies installed:
    ```bash
@@ -29,7 +30,7 @@ The Quiz Server has been converted to use WebSocket protocol, which allows it to
    LoadModule ssl_module modules/mod_ssl.so
    LoadModule proxy_module modules/mod_proxy.so
    LoadModule proxy_http_module modules/mod_proxy_http.so
-   LoadModule proxy_wstunnel_module modules/mod_proxy_wstunnel.so
+   LoadModule headers_module modules/mod_headers.so
    LoadModule rewrite_module modules/mod_rewrite.so
    ```
 
@@ -57,14 +58,14 @@ The Quiz Server has been converted to use WebSocket protocol, which allows it to
 
 ## Running the Server
 
-1. **Start the Python WebSocket Server**
+1. **Start the Python HTTP Server**
 
    ```bash
    cd Live-Quiz-Server
    python server.py
    ```
 
-   The server will start on `ws://127.0.0.1:8080` (without SSL, since Apache handles it).
+   The server will start on `http://127.0.0.1:8080` (without SSL, since Apache handles it).
 
 2. **Start/Restart Apache**
 
@@ -91,13 +92,13 @@ The Quiz Server has been converted to use WebSocket protocol, which allows it to
 
 When connecting through Apache, update the client configuration:
 
-1. **For HTTPS/WSS connections through Apache:**
+1. **For HTTPS connections through Apache:**
 
    Edit `client.py`:
    ```python
    HOST = 'your-domain.com'  # or Apache server IP
    PORT = 443  # or your Apache HTTPS port
-   WS_URL = f'wss://{HOST}:{PORT}'  # Use wss:// for secure WebSocket
+   BASE_URL = f'https://{HOST}:{PORT}'  # Use https:// for secure connection
    ```
 
 2. **For direct connection (bypassing Apache):**
@@ -105,20 +106,39 @@ When connecting through Apache, update the client configuration:
    ```python
    HOST = '127.0.0.1'
    PORT = 8080
-   WS_URL = f'ws://{HOST}:{PORT}'  # Direct connection without SSL
+   BASE_URL = f'http://{HOST}:{PORT}'  # Direct connection without SSL
    ```
+
+## API Endpoints
+
+The server provides the following REST API endpoints:
+
+- `POST /api/auth` - Authenticate user (returns session ID)
+- `GET /api/quiz/start` - Start quiz session (requires X-Session-ID header)
+- `GET /api/quiz/question` - Get current question (requires X-Session-ID header)
+- `POST /api/quiz/answer` - Submit answer (requires X-Session-ID header)
+- `GET /api/quiz/leaderboard` - Get current leaderboard
+- `GET /api/quiz/stream` - Server-Sent Events stream for real-time updates (requires X-Session-ID header)
+- `GET /api/health` - Health check endpoint
 
 ## Testing
 
-1. **Test WebSocket Connection**
+1. **Test HTTP Connection**
 
-   You can test the WebSocket connection using a tool like `wscat`:
+   You can test the HTTP connection using `curl`:
    ```bash
-   npm install -g wscat
-   wscat -c wss://your-domain.com
+   curl -k https://your-domain.com/api/health
    ```
 
-2. **Test with Client**
+2. **Test Authentication**
+
+   ```bash
+   curl -k -X POST https://your-domain.com/api/auth \
+     -H "Content-Type: application/json" \
+     -d '{"username":"fady","password":"fady123"}'
+   ```
+
+3. **Test with Client**
 
    Run the Python client:
    ```bash
@@ -127,16 +147,17 @@ When connecting through Apache, update the client configuration:
 
 ## Troubleshooting
 
-### WebSocket Connection Fails
+### HTTP Connection Fails
 
-1. **Check Apache Modules**: Ensure `mod_proxy_wstunnel` is enabled
+1. **Check Apache Modules**: Ensure required modules are enabled
    ```bash
-   apache2ctl -M | grep proxy_wstunnel
+   apache2ctl -M | grep proxy
+   apache2ctl -M | grep ssl
    ```
 
-2. **Check Rewrite Rules**: The WebSocket upgrade detection must work
-   - Verify `RewriteEngine on` is set
-   - Check that `RewriteCond` rules match WebSocket upgrade headers
+2. **Check Proxy Configuration**: Verify ProxyPass directives are correct
+   - Ensure the Python server is running on port 8080
+   - Check that ProxyPass and ProxyPassReverse are configured
 
 3. **Check Firewall**: Ensure ports 443 (HTTPS) and 8080 (internal) are open
 
@@ -150,28 +171,36 @@ When connecting through Apache, update the client configuration:
 
 1. **Server Not Running**: Ensure Python server is running on port 8080
 2. **Wrong Port**: Verify Apache is proxying to correct port (8080)
-3. **Network Issues**: Check if localhost connections work: `telnet 127.0.0.1 8080`
+3. **Network Issues**: Check if localhost connections work: `curl http://127.0.0.1:8080/api/health`
+
+### 502 Bad Gateway
+
+1. **Backend Not Running**: Ensure Python server is running and accessible
+2. **Wrong Backend URL**: Verify ProxyPass points to correct address (http://127.0.0.1:8080)
+3. **Backend Error**: Check Python server logs for errors
 
 ## Architecture
 
 ```
-Client (wss://) 
+Client (https://) 
     ↓
 Apache (HTTPS/443) 
-    ↓ (WebSocket Proxy)
-Python Server (ws://127.0.0.1:8080)
+    ↓ (HTTP Reverse Proxy)
+Python Server (http://127.0.0.1:8080)
 ```
 
-- **External**: Clients connect via `wss://your-domain.com:443`
-- **Internal**: Apache proxies to `ws://127.0.0.1:8080`
+- **External**: Clients connect via `https://your-domain.com:443`
+- **Internal**: Apache proxies to `http://127.0.0.1:8080`
 - **SSL**: Handled by Apache, Python server runs without SSL
+- **Protocol**: HTTP/HTTPS with REST API endpoints
 
 ## Security Considerations
 
 1. **Firewall**: Only expose port 443 (HTTPS) to the internet, keep 8080 internal
 2. **SSL/TLS**: Use valid SSL certificates in production (not self-signed)
-3. **Authentication**: The quiz server handles user authentication
+3. **Authentication**: The quiz server handles user authentication via session IDs
 4. **Rate Limiting**: Consider adding Apache rate limiting for production
+5. **Headers**: Security headers are set in Apache configuration
 
 ## Production Recommendations
 
@@ -180,4 +209,14 @@ Python Server (ws://127.0.0.1:8080)
 3. Monitor server resources and connection counts
 4. Use a reverse proxy cache if needed
 5. Implement proper SSL certificate management (Let's Encrypt, etc.)
+6. Consider using Gunicorn or similar WSGI/ASGI server for better performance
+7. Enable HTTP/2 in Apache for better performance
+8. Set up monitoring and alerting for server health
 
+## Differences from WebSocket Version
+
+- **Protocol**: HTTP/HTTPS instead of WebSocket
+- **Communication**: REST API with polling/SSE instead of persistent WebSocket connection
+- **Apache Config**: HTTP reverse proxy instead of WebSocket proxy
+- **Client**: Uses HTTP requests instead of WebSocket messages
+- **Real-time Updates**: Server-Sent Events (SSE) available for streaming updates

@@ -1,37 +1,72 @@
-import asyncio
 import json
 import time
 import logging
 import os
 import random
 import ssl
-import websockets
-from websockets.server import serve
-from websockets.exceptions import ConnectionClosed, WebSocketException
+import asyncio
+from typing import Dict, Optional
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 from exceptions import QuizError, NetworkError, DataFormatError, ResourceLoadError, AuthError
 
 HOST = '127.0.0.1'
 PORT = 8080
-USE_SSL = False  # Apache handles SSL, so we run without SSL on localhost
+USE_SSL = True  # Enable HTTPS/SSL support
 SSL_CERT_FILE = 'ssl/server.crt'
 SSL_KEY_FILE = 'ssl/server.key'
 QUESTION_TIME = 15
-ACK_TIMEOUT = 2
-ACK_RETRIES = 4
 
-clients = {}           # username -> {'ws': websocket, 'queue': asyncio.Queue, 'last_seen': ts, 'addr': addr}
-ws_to_user = {}        # websocket -> username
-scores = {}
-client_websockets = {} # username -> websocket
+# In-memory storage
+clients: Dict[str, Dict] = {}  # username -> {'session_id': str, 'last_seen': float, 'current_question': int, 'score': int}
+sessions: Dict[str, str] = {}  # session_id -> username
+scores: Dict[str, int] = {}
+active_quizzes: Dict[str, Dict] = {}  # username -> quiz state
+
+app = FastAPI(title="Quiz Server", version="2.0")
+
+# CORS middleware for web clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify allowed origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Custom formatter to replace log levels with HTTP status codes
+class StatusCodeFormatter(logging.Formatter):
+    """Formatter that replaces log levels with HTTP status codes."""
+    STATUS_CODES = {
+        logging.DEBUG: 100,
+        logging.INFO: 200,
+        logging.WARNING: 300,
+        logging.ERROR: 500,
+        logging.CRITICAL: 500
+    }
+    
+    def format(self, record):
+        # Replace levelname with status code
+        status_code = self.STATUS_CODES.get(record.levelno, 200)
+        record.levelname = str(status_code)
+        return super().format(record)
 
 # Setup logging
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    filename=os.path.join(LOG_DIR, "server.log"),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+
+# Create logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Create file handler with custom formatter
+file_handler = logging.FileHandler(os.path.join(LOG_DIR, "server.log"))
+file_handler.setFormatter(StatusCodeFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(file_handler)
 
 # Clear server log on startup
 try:
@@ -51,246 +86,317 @@ def load_users():
         logging.error("users.json not valid JSON; continuing with empty users.")
         return {}
 
-async def send_json(ws, data):
-    """Send a JSON message over WebSocket."""
+def load_questions():
+    """Load questions from questions.json"""
     try:
-        payload = json.dumps(data)
-        await ws.send(payload)
-    except (ConnectionClosed, WebSocketException) as e:
-        raise NetworkError(f"Failed to send: {e}") from e
-    except (TypeError, ValueError, json.JSONDecodeError) as e:
-        raise DataFormatError(f"Failed to serialize message: {e}") from e
-
-async def handle_client(websocket, path):
-    """Handle a single client WebSocket connection."""
-    addr = websocket.remote_address
-    try:
-        async for message in websocket:
-            try:
-                msg = json.loads(message)
-            except (UnicodeDecodeError, json.JSONDecodeError) as e:
-                logging.exception("Malformed JSON from %s", addr)
-                continue
-            
-            msg['_addr'] = addr
-            msg['_ws'] = websocket
-            
-            # Route message based on type
-            mtype = msg.get('type')
-            if mtype == 'auth':
-                await handle_auth_message(websocket, msg)
-            else:
-                # Route to client's queue if authenticated
-                user = ws_to_user.get(websocket)
-                if user and user in clients:
-                    await clients[user]['queue'].put(msg)
-                    clients[user]['last_seen'] = time.time()
-                else:
-                    # Not authenticated, discard
-                    logging.warning("Message from unauthenticated client %s", addr)
-    except ConnectionClosed:
-        logging.info("Client %s disconnected", addr)
+        with open('questions.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError as e:
+        raise ResourceLoadError(f"questions.json not found: {e}") from e
+    except json.JSONDecodeError as e:
+        raise DataFormatError(f"questions.json is invalid JSON: {e}") from e
     except Exception as e:
-        logging.exception("Error handling client %s: %s", addr, e)
-    finally:
-        # Cleanup client
-        user = ws_to_user.pop(websocket, None)
-        if user:
-            clients.pop(user, None)
-            client_websockets.pop(user, None)
-            logging.info("Cleaned up client %s (user: %s)", addr, user)
+        raise ResourceLoadError(f"Failed to load questions.json: {e}") from e
 
-async def send_with_ack(ws, msg, q, expected_ack_type, seq, timeout=ACK_TIMEOUT, retries=ACK_RETRIES):
-    """Send msg and wait for an ACK of expected type and matching seq."""
-    last_err = None
-    for attempt in range(retries):
-        try:
-            await send_json(ws, msg)
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    incoming = await asyncio.wait_for(q.get(), timeout=deadline - time.time())
-                except asyncio.TimeoutError:
-                    break
-                if incoming.get('type') == expected_ack_type and incoming.get('seq') == seq:
-                    return True
-                else:
-                    # not the ack we expected; push back for other handlers
-                    await q.put(incoming)
-                    break
-        except Exception as e:
-            last_err = e
-            logging.exception("send_with_ack exception: %s", e)
-        await asyncio.sleep(0.5 * (attempt + 1))
-    logging.warning("No ACK received for seq %s after %d tries. Last error: %s", seq, retries, last_err)
-    return False
-
-async def handle_auth_message(ws, msg):
-    """Handle incoming auth message, reply with auth_ack and start session."""
-    addr = msg.get('_addr')
-    username = msg.get('username')
-    password = msg.get('password')
-    seq = msg.get('seq', random.randint(1, 1_000_000))
-    users = load_users()
-
-    if username in users and users[username] == password:
-        # create client entry
-        client_queue = asyncio.Queue()
-        clients[username] = {
-            'ws': ws,
-            'addr': addr,
-            'queue': client_queue,
-            'last_seen': time.time()
+@app.get("/")
+async def root():
+    """Root endpoint - API information."""
+    return JSONResponse({
+        'status': 'ok',
+        'message': 'Live Quiz Server API',
+        'version': '2.0',
+        'endpoints': {
+            'docs': '/docs',
+            'redoc': '/redoc',
+            'health': '/api/health',
+            'auth': '/api/auth',
+            'quiz_start': '/api/quiz/start',
+            'quiz_question': '/api/quiz/question',
+            'quiz_answer': '/api/quiz/answer',
+            'leaderboard': '/api/quiz/leaderboard',
+            'quiz_stream': '/api/quiz/stream'
         }
-        ws_to_user[ws] = username
-        client_websockets[username] = ws
+    })
 
-        ack = {'type': 'auth_ack', 'status': 'ok', 'seq': seq}
-        try:
-            await send_json(ws, ack)
-            logging.debug("Sent auth_ack to %s for user %s", addr, username)
-        except QuizError as e:
-            logging.exception("Failed to send auth_ack: %s", e)
-            return
-
-        logging.info("User %s authenticated from %s", username, addr)
-        # start quiz session as async task
-        asyncio.create_task(quiz_session(ws, username))
-    else:
-        ack = {'type': 'auth_ack', 'status': 'fail', 'seq': seq}
-        try:
-            await send_json(ws, ack)
-            logging.debug("Sent auth_ack (fail) to %s for user %s", addr, username)
-        except QuizError as e:
-            logging.exception("Failed to send auth_ack: %s", e)
-        logging.info("Failed auth for %s from %s", username, addr)
-
-async def quiz_session(ws, username):
-    """Per-client quiz flow: send questions, wait for answers via client's queue."""
+@app.post("/api/auth")
+async def authenticate(request: Request):
+    """Authenticate user and return session ID."""
     try:
-        client_info = clients.get(username)
-        if not client_info:
-            logging.warning("quiz_session started but client not found: %s", username)
-            return
-        q = client_info['queue']
-
-        # load questions
-        try:
-            with open('questions.json', 'r') as f:
-                questions = json.load(f)
-        except FileNotFoundError as e:
-            raise ResourceLoadError(f"questions.json not found: {e}") from e
-        except json.JSONDecodeError as e:
-            raise DataFormatError(f"questions.json is invalid JSON: {e}") from e
-        except Exception as e:
-            raise ResourceLoadError(f"Failed to load questions.json: {e}") from e
-
-        score = 0
-        for idx, question in enumerate(questions, start=1):
-            seq = random.randint(1, 1_000_000)
-            msg = {
-                'type': 'question',
-                'seq': seq,
-                'index': idx,
-                'question': question['question'],
-                'options': question['options'],
-                'time': QUESTION_TIME
-            }
-            ok = await send_with_ack(ws, msg, q, expected_ack_type='ack', seq=seq)
-            if not ok:
-                logging.warning("Client %s did not ACK question %s; continuing.", username, seq)
-
-            # wait for answer or timeout
-            answer = None
-            deadline = time.time() + QUESTION_TIME
-            while time.time() < deadline:
-                try:
-                    incoming = await asyncio.wait_for(q.get(), timeout=deadline - time.time())
-                except asyncio.TimeoutError:
-                    break
-                if incoming.get('type') == 'answer' and incoming.get('seq') == seq:
-                    answer = incoming.get('answer')
-                    # send answer ACK to client
-                    ack = {'type': 'ack', 'seq': seq}
-                    try:
-                        await send_json(ws, ack)
-                    except QuizError as e:
-                        logging.exception("Failed to send ACK: %s", e)
-                    break
-                else:
-                    # ignore unrelated messages here
-                    await q.put(incoming)
-                    break
-
-            correct = (answer == question.get('answer'))
-            if correct:
-                score += 1
-                res_msg = {'type': 'result', 'seq': seq, 'status': 'correct'}
-            else:
-                res_msg = {'type': 'result', 'seq': seq, 'status': 'wrong', 'correct': question.get('answer')}
-            try:
-                await send_json(ws, res_msg)
-            except QuizError as e:
-                logging.exception("Failed to send result: %s", e)
-
-        # save score and broadcast leaderboard
-        scores[username] = score
-        leaderboard = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        target_ws_list = [info['ws'] for info in clients.values() if info['ws'] != ws]
-
-        lb_msg = {'type': 'leaderboard', 'leaderboard': leaderboard}
-        # Send to current client
-        try:
-            await send_json(ws, lb_msg)
-        except QuizError as e:
-            logging.exception("Failed to send leaderboard: %s", e)
+        data = await request.json()
+        username = data.get('username')
+        password = data.get('password')
         
-        # Send to other clients
-        for target_ws in target_ws_list:
-            try:
-                await send_json(target_ws, lb_msg)
-            except QuizError as e:
-                logging.exception("Failed to send leaderboard: %s", e)
-
-        logging.info("User %s finished quiz with score %s", username, score)
-
-    except QuizError as e:
-        logging.exception("Quiz error in quiz_session for %s: %s", username, e)
+        if not username or not password:
+            raise HTTPException(status_code=400, detail="Username and password required")
+        
+        users = load_users()
+        
+        if username in users and users[username] == password:
+            # Generate session ID
+            session_id = f"{username}_{int(time.time())}_{random.randint(1000, 9999)}"
+            sessions[session_id] = username
+            
+            # Initialize client
+            clients[username] = {
+                'session_id': session_id,
+                'last_seen': time.time(),
+                'current_question': 0,
+                'score': 0,
+                'started': False
+            }
+            
+            logging.info("User %s authenticated from %s", username, request.client.host)
+            return JSONResponse({
+                'status': 'ok',
+                'session_id': session_id,
+                'username': username
+            })
+        else:
+            logging.info("Failed auth for %s from %s", username, request.client.host)
+            raise HTTPException(status_code=401, detail="Authentication failed")
+            
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.exception("Error in quiz_session for %s: %s", username, e)
+        logging.exception("Auth error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-async def start_server():
-    """Start the WebSocket quiz server (Apache handles SSL)."""
+@app.get("/api/quiz/start")
+async def start_quiz(session_id: str = Header(..., alias="X-Session-ID")):
+    """Start quiz session for authenticated user."""
     try:
-        # Create SSL context if using SSL (for direct connections, not through Apache)
-        ssl_context = None
-        if USE_SSL:
-            try:
-                os.makedirs('ssl', exist_ok=True)
-                if not os.path.exists(SSL_CERT_FILE) or not os.path.exists(SSL_KEY_FILE):
-                    logging.warning("SSL certificate files not found. Generating self-signed certificate...")
-                    generate_self_signed_cert()
-                
-                ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ssl_context.load_cert_chain(SSL_CERT_FILE, SSL_KEY_FILE)
-                logging.info("SSL enabled. Using certificate: %s", SSL_CERT_FILE)
-            except Exception as e:
-                logging.error("Failed to setup SSL: %s. Continuing without SSL...", e)
-                ssl_context = None
-
-        ssl_status = "with SSL" if ssl_context else "(Apache handles SSL)"
-        logging.info("WebSocket server starting on ws://%s:%s %s", HOST, PORT, ssl_status)
-        print(f"✅ WebSocket server started on ws://{HOST}:{PORT} {ssl_status}")
-        print(f"   Configure Apache to proxy WebSocket connections to this server")
-
-        # Start WebSocket server
-        async with serve(handle_client, HOST, PORT, ssl=ssl_context):
-            await asyncio.Future()  # run forever
-
-    except QuizError as e:
-        logging.exception("Failed to start server: %s", e)
+        username = sessions.get(session_id)
+        if not username or username not in clients:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        
+        client = clients[username]
+        if client['started']:
+            raise HTTPException(status_code=400, detail="Quiz already started")
+        
+        # Initialize quiz state
+        questions = load_questions()
+        client['started'] = True
+        client['current_question'] = 0
+        client['score'] = 0
+        client['last_seen'] = time.time()
+        
+        active_quizzes[username] = {
+            'questions': questions,
+            'start_time': time.time(),
+            'current_index': 0
+        }
+        
+        logging.info("Quiz started for user %s", username)
+        return JSONResponse({
+            'status': 'ok',
+            'total_questions': len(questions),
+            'question_time': QUESTION_TIME
+        })
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.exception("Unexpected server error: %s", e)
+        logging.exception("Start quiz error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quiz/question")
+async def get_question(session_id: str = Header(..., alias="X-Session-ID")):
+    """Get current question for the user."""
+    try:
+        username = sessions.get(session_id)
+        if not username or username not in clients:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        
+        client = clients[username]
+        if not client['started']:
+            raise HTTPException(status_code=400, detail="Quiz not started")
+        
+        quiz = active_quizzes.get(username)
+        if not quiz:
+            raise HTTPException(status_code=404, detail="Quiz not found")
+        
+        current_idx = quiz['current_index']
+        questions = quiz['questions']
+        
+        if current_idx >= len(questions):
+            # Quiz completed
+            return JSONResponse({
+                'status': 'completed',
+                'score': client['score'],
+                'total': len(questions)
+            })
+        
+        question = questions[current_idx]
+        seq = random.randint(1, 1_000_000)
+        
+        client['last_seen'] = time.time()
+        
+        return JSONResponse({
+            'status': 'ok',
+            'seq': seq,
+            'index': current_idx + 1,
+            'question': question['question'],
+            'options': question['options'],
+            'time': QUESTION_TIME
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("Get question error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/quiz/answer")
+async def submit_answer(request: Request):
+    """Submit answer for current question."""
+    try:
+        session_id = request.headers.get("X-Session-ID")
+        if not session_id:
+            raise HTTPException(status_code=401, detail="Session ID required")
+        
+        username = sessions.get(session_id)
+        if not username or username not in clients:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        
+        data = await request.json()
+        answer = data.get('answer')
+        seq = data.get('seq')
+        
+        if answer is None:
+            raise HTTPException(status_code=400, detail="Answer required")
+        
+        client = clients[username]
+        if not client['started']:
+            raise HTTPException(status_code=400, detail="Quiz not started")
+        
+        quiz = active_quizzes.get(username)
+        if not quiz:
+            raise HTTPException(status_code=404, detail="Quiz not found")
+        
+        current_idx = quiz['current_index']
+        questions = quiz['questions']
+        
+        if current_idx >= len(questions):
+            raise HTTPException(status_code=400, detail="Quiz already completed")
+        
+        question = questions[current_idx]
+        correct = (answer.upper() == question.get('answer', '').upper())
+        
+        if correct:
+            client['score'] += 1
+            scores[username] = client['score']
+        
+        # Move to next question
+        quiz['current_index'] += 1
+        client['last_seen'] = time.time()
+        
+        result = {
+            'status': 'correct' if correct else 'wrong',
+            'seq': seq,
+            'correct_answer': question.get('answer') if not correct else None,
+            'score': client['score'],
+            'current_question': quiz['current_index'] + 1,
+            'total_questions': len(questions)
+        }
+        
+        logging.info("User %s answered question %d: %s (correct: %s)", 
+                    username, current_idx + 1, answer, correct)
+        
+        return JSONResponse(result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("Submit answer error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quiz/leaderboard")
+async def get_leaderboard():
+    """Get current leaderboard."""
+    try:
+        leaderboard = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return JSONResponse({
+            'status': 'ok',
+            'leaderboard': leaderboard
+        })
+    except Exception as e:
+        logging.exception("Get leaderboard error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quiz/stream")
+async def stream_quiz(session_id: str = Header(..., alias="X-Session-ID")):
+    """Server-Sent Events stream for real-time quiz updates."""
+    username = sessions.get(session_id)
+    if not username or username not in clients:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    client = clients[username]
+    if not client['started']:
+        raise HTTPException(status_code=400, detail="Quiz not started")
+    
+    async def event_generator():
+        try:
+            quiz = active_quizzes.get(username)
+            if not quiz:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Quiz not found'})}\n\n"
+                return
+            
+            questions = quiz['questions']
+            current_idx = 0
+            
+            while current_idx < len(questions):
+                question = questions[current_idx]
+                seq = random.randint(1, 1_000_000)
+                
+                question_data = {
+                    'type': 'question',
+                    'seq': seq,
+                    'index': current_idx + 1,
+                    'question': question['question'],
+                    'options': question['options'],
+                    'time': QUESTION_TIME
+                }
+                
+                yield f"data: {json.dumps(question_data)}\n\n"
+                
+                # Wait for answer or timeout
+                start_time = time.time()
+                answered = False
+                
+                while time.time() - start_time < QUESTION_TIME and not answered:
+                    await asyncio.sleep(0.5)
+                    # Check if answer was submitted (simplified - in real implementation, 
+                    # you'd check a shared state)
+                    if quiz['current_index'] > current_idx:
+                        answered = True
+                
+                current_idx = quiz['current_index']
+            
+            # Quiz completed
+            final_score = client['score']
+            scores[username] = final_score
+            leaderboard = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            
+            completion_data = {
+                'type': 'completed',
+                'score': final_score,
+                'total': len(questions),
+                'leaderboard': leaderboard
+            }
+            
+            yield f"data: {json.dumps(completion_data)}\n\n"
+            
+        except Exception as e:
+            logging.exception("SSE stream error: %s", e)
+            error_data = {'type': 'error', 'message': str(e)}
+            yield f"data: {json.dumps(error_data)}\n\n"
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint."""
+    return JSONResponse({'status': 'ok', 'timestamp': datetime.now().isoformat()})
 
 def generate_self_signed_cert():
     """Generate a self-signed SSL certificate for development."""
@@ -320,12 +426,9 @@ def generate_self_signed_cert():
         # Add Subject Alternative Name (SAN)
         san_list = [x509.DNSName(HOST)]
         try:
-            # Try to add IP address if HOST is an IP
-            # Verify it's a valid IP by parsing it
             ip_obj = ipaddress.IPv4Address(HOST)
             san_list.append(x509.IPAddress(ip_obj))
         except ValueError:
-            # Not an IP address, skip IP address in SAN
             pass
         
         cert = x509.CertificateBuilder().subject_name(
@@ -365,7 +468,35 @@ def generate_self_signed_cert():
         print("   Or provide SSL certificate files manually in the ssl/ directory")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(start_server())
-    except KeyboardInterrupt:
-        print("\n🛑 Server shutting down...")
+    import asyncio
+    
+    # Create SSL context if using SSL
+    ssl_context = None
+    if USE_SSL:
+        try:
+            os.makedirs('ssl', exist_ok=True)
+            if not os.path.exists(SSL_CERT_FILE) or not os.path.exists(SSL_KEY_FILE):
+                logging.warning("SSL certificate files not found. Generating self-signed certificate...")
+                generate_self_signed_cert()
+            
+            ssl_context = (SSL_CERT_FILE, SSL_KEY_FILE)
+            logging.info("SSL enabled. Using certificate: %s", SSL_CERT_FILE)
+        except Exception as e:
+            logging.error("Failed to setup SSL: %s. Continuing without SSL...", e)
+            ssl_context = None
+    
+    protocol = "https" if ssl_context else "http"
+    logging.info("HTTP server starting on %s://%s:%s", protocol, HOST, PORT)
+    print(f"✅ HTTP server started on {protocol}://{HOST}:{PORT}")
+    if ssl_context:
+        print(f"   🔒 HTTPS/SSL enabled")
+    print(f"   Configure Apache to proxy HTTP requests to this server")
+    
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        ssl_keyfile=SSL_KEY_FILE if ssl_context else None,
+        ssl_certfile=SSL_CERT_FILE if ssl_context else None,
+        log_level="info"
+    )

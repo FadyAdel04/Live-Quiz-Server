@@ -1,7 +1,6 @@
-🧠 Live Quiz Server (Python Socket Project)
+🧠 Live Quiz Server (HTTP/HTTPS Version)
 
-A real-time multiplayer quiz game built using Python’s socket and threading libraries.
-Players can join from multiple devices on the same Wi-Fi network, answer quiz questions, and see a live leaderboard update in real-time.
+A real-time multiplayer quiz game built using Python’s FastAPI framework with HTTP/HTTPS support. Players can join from multiple devices, answer quiz questions, and see a live leaderboard update in real-time. The server can be deployed behind Apache with SSL/TLS support.
 
 🎯 Features
 
@@ -9,29 +8,39 @@ Players can join from multiple devices on the same Wi-Fi network, answer quiz qu
 
 🕒 Timed questions: Each player has a time limit per question
 
-🧑‍💻 Authentication: Username/password required before joining (optional)
+🧑‍💻 Authentication: Username/password required before joining
 
 🧾 Dynamic leaderboard: Updated after each player finishes
 
 🧠 JSON-based questions: Easily customizable
 
-🌐 LAN-ready: Works across multiple devices on the same local network
+🌐 HTTP/HTTPS support: Works with Apache reverse proxy and SSL/TLS
+
+🔒 Secure connections: SSL/TLS encryption support
+
+📡 REST API: Standard HTTP endpoints for easy integration
 
 🏗️ Tech Stack
 
 Language: Python 3.8+
 
-Libraries: socket, threading, json, time
+Libraries: FastAPI, uvicorn, requests
+
+Protocol: HTTP/HTTPS with REST API
 
 Files:
 
-server.py → The quiz server
+server.py → The quiz server (FastAPI application)
 
-client.py → The quiz client
+client.py → The quiz client (Command-line HTTP client)
+
+client_gui.py → The quiz client (GUI version with tkinter)
 
 questions.json → Stores quiz questions
 
-users.json → Stores usernames and passwords (optional)
+users.json → Stores usernames and passwords
+
+apache_ssl.conf → Apache configuration for SSL/TLS reverse proxy
 
 📁 Project Structure
 📦 live-quiz-server
@@ -39,21 +48,30 @@ users.json → Stores usernames and passwords (optional)
  ┣ 📜 client.py
  ┣ 📜 questions.json
  ┣ 📜 users.json
+ ┣ 📜 apache_ssl.conf
+ ┣ 📜 requirements.txt
+ ┣ 📜 APACHE_SETUP.md
  ┗ 📜 README.md
 
 ⚙️ How It Works
 
-The server hosts the quiz and listens for connections on a specific IP and port.
+The server runs as a FastAPI HTTP/HTTPS application listening on a specific IP and port.
 
-Each client connects, enters a username (and password if required).
+Each client connects via HTTP requests, authenticates with username/password, and receives a session ID.
 
-The server sends quiz questions one by one with a time limit.
+The server provides REST API endpoints for quiz operations:
+- Authentication endpoint
+- Start quiz endpoint
+- Get question endpoint
+- Submit answer endpoint
+- Leaderboard endpoint
 
-Each correct answer increases the player’s score.
+Clients poll the server for questions and submit answers via HTTP POST requests.
 
-At the end, all players see the final leaderboard broadcast from the server.
+At the end, all players can see the final leaderboard.
 
 🚀 Setup Guide
+
 1️⃣ Install Python
 
 Make sure Python 3.8 or higher is installed.
@@ -62,37 +80,36 @@ Check using:
 
 python --version
 
-2️⃣ Prepare Files
+2️⃣ Install Dependencies
 
-Clone or copy the project files into a folder on your computer.
+Install required Python packages:
 
-3️⃣ Edit Server Configuration
+pip install -r requirements.txt
 
-Open server.py and change this line:
+This will install:
+- FastAPI (web framework)
+- uvicorn (ASGI server)
+- requests (HTTP client library)
+- cryptography (for SSL certificate generation, optional)
 
-HOST = '0.0.0.0'
-PORT = 5555
+3️⃣ Prepare Files
 
+Ensure all project files are in the same directory:
+- server.py
+- client.py
+- questions.json
+- users.json
+- exceptions.py
 
-0.0.0.0 allows connections from any device on your network.
+4️⃣ Configure Server
 
-4️⃣ Find Your Local IP
+The server runs on `http://127.0.0.1:8080` by default. You can modify these settings in `server.py`:
 
-On the server device, find your local IP:
-
-Windows:
-
-ipconfig
-
-
-Example: 192.168.1.10
-
-macOS/Linux:
-
-ifconfig
-
-
-Example: 192.168.1.10
+```python
+HOST = '127.0.0.1'  # Change to '0.0.0.0' to allow external connections
+PORT = 8080
+USE_SSL = True  # Enable HTTPS/SSL support
+```
 
 5️⃣ Start the Server
 
@@ -100,39 +117,74 @@ Run:
 
 python server.py
 
-
 Output:
 
-Server started on 0.0.0.0:5555
-Server local IP: 192.168.1.10
+✅ HTTP server started on https://127.0.0.1:8080
+   🔒 HTTPS/SSL enabled
+   Configure Apache to proxy HTTP requests to this server
 
-6️⃣ Configure Clients
+6️⃣ Run the Client
 
-On each client device (must be connected to the same Wi-Fi network):
+You have two options for the client:
 
-Open client.py and update:
+**Option A: GUI Client (Recommended)**
 
-HOST = '192.168.1.10'  # your server’s local IP
-PORT = 5555
+Run the graphical user interface:
 
+```bash
+python client_gui.py
+```
+
+The GUI client provides:
+- Modern, user-friendly interface
+- Visual question display with clickable options
+- Real-time timer and score display
+- Live leaderboard updates
+- Server URL configuration
+
+**Option B: Command Line Client**
+
+Open `client.py` and update if needed:
+
+```python
+HOST = '127.0.0.1'  # or your server's IP address
+PORT = 8080  # or 443 if using Apache
+BASE_URL = f'https://{HOST}:{PORT}'  # or http:// if not using SSL
+```
 
 Then run:
 
+```bash
 python client.py
+```
 
 7️⃣ Play!
 
-Each player enters a username (and password if enabled).
+Each player enters a username and password.
 
 The quiz begins, one question at a time.
 
 After the quiz, everyone sees the shared leaderboard.
 
+🌐 Apache Setup (Optional)
+
+For production deployment with SSL/TLS termination:
+
+1. Install and configure Apache 2.4+
+2. Enable required modules (mod_ssl, mod_proxy, mod_proxy_http)
+3. Copy `apache_ssl.conf` to your Apache configuration
+4. Update certificate paths and ServerName in the config
+5. Restart Apache
+
+See `APACHE_SETUP.md` for detailed instructions.
+
 📋 JSON Files
+
 🧾 questions.json
 
 Example:
 
+```json
 [
   {
     "question": "What is the capital of France?",
@@ -140,62 +192,97 @@ Example:
     "answer": "B"
   }
 ]
+```
 
-🔐 users.json (optional)
+🔐 users.json
 
 Example:
 
+```json
 {
-  "fady": "1234",
-  "omar": "abcd"
+  "fady": "fady123",
+  "fares": "pass123",
+  "youssef": "54321"
 }
+```
+
+📡 API Endpoints
+
+- `POST /api/auth` - Authenticate user (returns session ID)
+- `GET /api/quiz/start` - Start quiz session (requires X-Session-ID header)
+- `GET /api/quiz/question` - Get current question (requires X-Session-ID header)
+- `POST /api/quiz/answer` - Submit answer (requires X-Session-ID header)
+- `GET /api/quiz/leaderboard` - Get current leaderboard
+- `GET /api/quiz/stream` - Server-Sent Events stream for real-time updates
+- `GET /api/health` - Health check endpoint
 
 🌐 Connecting from Other Devices
 
-✅ All devices must be on the same Wi-Fi/LAN
-✅ Use the server’s local IP (not 127.0.0.1)
+✅ All devices must be on the same network (or use public IP/domain)
+
+✅ Use the server's IP address (not 127.0.0.1 for remote connections)
+
+✅ If using Apache, connect via HTTPS on port 443
+
 ✅ If Windows Firewall blocks connections:
-
-Go to Windows Defender Firewall → Allow an app → Allow Python
-
-Or allow port 5555 for private networks
+   - Go to Windows Defender Firewall → Allow an app → Allow Python
+   - Or allow port 8080 (or 443 if using Apache) for private networks
 
 🛠️ Troubleshooting
-Problem	Cause	Solution
-❌ Connection refused	Wrong IP or port	Use the correct local IP and same port
-🔥 Timeout / no response	Firewall blocking port	Allow Python or open TCP 5555
-❓ Can’t ping server	Not same Wi-Fi	Connect all devices to same router
-⚙️ One client only	Server bound to 127.0.0.1	Use 0.0.0.0 in server.py
+
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| ❌ Connection refused | Wrong IP or port | Use the correct IP and port |
+| 🔥 Timeout / no response | Firewall blocking port | Allow Python or open TCP 8080/443 |
+| ❓ Can't connect | Not same network | Connect all devices to same network |
+| ⚙️ SSL certificate error | Self-signed certificate | Accept certificate warning or use valid cert |
+| 🔒 401 Unauthorized | Invalid session | Re-authenticate with username/password |
+| 📡 502 Bad Gateway | Backend not running | Ensure Python server is running on port 8080 |
+
 💡 Ideas for Extension
 
-🪄 GUI using Tkinter or PyQt
+🪄 Web-based GUI using React or Vue.js
 
-🌍 Remote access using port forwarding
+🌍 Remote access using port forwarding or cloud deployment
 
-📊 Web-based leaderboard using Flask or FastAPI
+📊 Real-time leaderboard updates using WebSockets or SSE
 
 🔒 Password hashing for users (with bcrypt)
 
 🎮 Room-based multiplayer (Room A, Room B, etc.)
 
-👨‍💻 Example Output
-Welcome to the quiz!
+📱 Mobile app integration via REST API
 
-Question 1:
-What is the capital of France?
+👨‍💻 Example Output
+
+```
+==================================================
+Quiz Client - HTTP/HTTPS Version
+==================================================
+Username: fady
+Password: fady123
+✅ Authenticated as fady. Starting quiz...
+✅ Quiz started! 10 questions, 15 seconds per question
+
+Question 1/10: What is the capital of France?
 A) Berlin
 B) Paris
 C) Rome
 D) Madrid
-You have 15 seconds. Enter A/B/C/D:
+You have 15 seconds. Enter A/B/C/D (or press Enter to skip):
 > B
 ✅ Correct!
+Current score: 1/1
 
-Your total score: 8
+...
 
 🏆 Leaderboard:
-1. Fady - 8
-2. Omar - 6
+fady: 8
+fares: 6
+youssef: 5
+
+✅ Quiz completed! Your final score: 8/10
+```
 
 🏁 License
 

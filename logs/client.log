@@ -1,3 +1,0 @@
-2025-11-09 22:31:28,138 [INFO] Connected to WebSocket server
-2025-11-09 22:31:28,138 [INFO] Sending auth message with seq 513441
-2025-11-09 22:31:28,141 [INFO] Received auth_ack with status: ok

@@ -1,29 +1,53 @@
-import asyncio
 import json
 import time
 import random
 import logging
 import os
-import websockets
-from websockets.exceptions import ConnectionClosed, WebSocketException
+import ssl
+import requests
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+from threading import Thread, Event
+import sys
+from requests.exceptions import RequestException, ConnectionError, Timeout
 from exceptions import QuizError, NetworkError, DataFormatError, AuthError
 
 HOST = '127.0.0.1'  # Replace with your server IP or Apache server
 PORT = 8080
-USE_SSL = False  # Apache handles SSL, use wss:// when connecting through Apache
-WS_URL = f'ws://{HOST}:{PORT}'  # Use wss:// when connecting through Apache HTTPS
-ACK_TIMEOUT = 2
-ACK_RETRIES = 4
+USE_SSL = True  # Enable HTTPS/SSL support
+BASE_URL = f'https://{HOST}:{PORT}' if USE_SSL else f'http://{HOST}:{PORT}'
+QUESTION_TIME = 15
 RECONNECT_BACKOFF = [1, 2, 5, 10]
+
+# Custom formatter to replace log levels with HTTP status codes
+class StatusCodeFormatter(logging.Formatter):
+    """Formatter that replaces log levels with HTTP status codes."""
+    STATUS_CODES = {
+        logging.DEBUG: 100,
+        logging.INFO: 200,
+        logging.WARNING: 300,
+        logging.ERROR: 500,
+        logging.CRITICAL: 500
+    }
+    
+    def format(self, record):
+        # Replace levelname with status code
+        status_code = self.STATUS_CODES.get(record.levelno, 200)
+        record.levelname = str(status_code)
+        return super().format(record)
 
 # logging
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    filename=os.path.join(LOG_DIR, "client.log"),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+
+# Create logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Create file handler with custom formatter
+file_handler = logging.FileHandler(os.path.join(LOG_DIR, "client.log"))
+file_handler.setFormatter(StatusCodeFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(file_handler)
 
 # Clear client log on startup
 try:
@@ -31,268 +55,547 @@ try:
 except Exception:
     pass
 
-recv_queue = asyncio.Queue()
-stop_event = asyncio.Event()
+# Create session with SSL verification disabled for self-signed certificates
+session = requests.Session()
+if USE_SSL:
+    session.verify = False
+    # Disable SSL warnings for self-signed certificates
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-
-async def send_json(ws, data):
-    try:
+class QuizClientGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Live Quiz Client")
+        self.root.geometry("800x600")
+        self.root.configure(bg='#f0f0f0')
+        
+        # Quiz state variables
+        self.session_id = None
+        self.username = None
+        self.quiz_active = False
+        self.current_question = None
+        self.answer_buttons = []
+        self.timer_event = None
+        self.time_left = 0
+        self.stop_event = Event()
+        
+        self.setup_gui()
+        
+    def setup_gui(self):
+        """Setup the GUI components"""
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(3, weight=1)
+        
+        # Login frame
+        login_frame = ttk.LabelFrame(main_frame, text="Login", padding="10")
+        login_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        login_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(login_frame, text="Username:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.username_entry = ttk.Entry(login_frame, width=20)
+        self.username_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
+        
+        ttk.Label(login_frame, text="Password:").grid(row=0, column=2, sticky=tk.W, padx=(0, 5))
+        self.password_entry = ttk.Entry(login_frame, width=20, show="*")
+        self.password_entry.grid(row=0, column=3, sticky=(tk.W, tk.E), padx=(0, 10))
+        
+        self.login_button = ttk.Button(login_frame, text="Login", command=self.login)
+        self.login_button.grid(row=0, column=4, padx=(10, 0))
+        
+        # Bind Enter key to login
+        self.username_entry.bind('<Return>', lambda e: self.login())
+        self.password_entry.bind('<Return>', lambda e: self.login())
+        
+        # Status frame
+        status_frame = ttk.LabelFrame(main_frame, text="Status", padding="10")
+        status_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        status_frame.columnconfigure(0, weight=1)
+        
+        self.status_var = tk.StringVar(value="Not connected")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, foreground="red")
+        self.status_label.grid(row=0, column=0, sticky=tk.W)
+        
+        # Timer label
+        self.timer_var = tk.StringVar(value="Time: --")
+        self.timer_label = ttk.Label(status_frame, textvariable=self.timer_var, font=('Arial', 12, 'bold'))
+        self.timer_label.grid(row=0, column=1, sticky=tk.E)
+        
+        # Score label
+        self.score_var = tk.StringVar(value="Score: 0/0")
+        self.score_label = ttk.Label(status_frame, textvariable=self.score_var)
+        self.score_label.grid(row=0, column=2, sticky=tk.E, padx=(10, 0))
+        
+        # Question frame
+        self.question_frame = ttk.LabelFrame(main_frame, text="Question", padding="15")
+        self.question_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        self.question_frame.columnconfigure(0, weight=1)
+        
+        self.question_var = tk.StringVar(value="Please login and start the quiz")
+        self.question_label = ttk.Label(self.question_frame, textvariable=self.question_var, 
+                                      wraplength=700, justify=tk.LEFT, font=('Arial', 11))
+        self.question_label.grid(row=0, column=0, sticky=tk.W)
+        
+        # Options frame
+        self.options_frame = ttk.Frame(self.question_frame)
+        self.options_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+        self.options_frame.columnconfigure(0, weight=1)
+        
+        # Control buttons frame
+        control_frame = ttk.Frame(main_frame)
+        control_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        control_frame.columnconfigure(0, weight=1)
+        
+        self.start_button = ttk.Button(control_frame, text="Start Quiz", command=self.start_quiz, state=tk.DISABLED)
+        self.start_button.grid(row=0, column=0, padx=(0, 5))
+        
+        self.leaderboard_button = ttk.Button(control_frame, text="Show Leaderboard", 
+                                           command=self.show_leaderboard, state=tk.DISABLED)
+        self.leaderboard_button.grid(row=0, column=1, padx=5)
+        
+        # Log/Output frame
+        output_frame = ttk.LabelFrame(main_frame, text="Activity Log", padding="5")
+        output_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        output_frame.columnconfigure(0, weight=1)
+        output_frame.rowconfigure(0, weight=1)
+        main_frame.rowconfigure(4, weight=1)
+        
+        self.log_text = scrolledtext.ScrolledText(output_frame, height=10, width=80, state=tk.DISABLED)
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Initially hide question frame
+        self.hide_question()
+        
+    def hide_question(self):
+        """Hide question and options"""
+        self.question_frame.grid_remove()
+        
+    def show_question(self):
+        """Show question frame"""
+        self.question_frame.grid()
+        
+    def log_message(self, message, color="black"):
+        """Add message to log area"""
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.insert(tk.END, f"{time.strftime('%H:%M:%S')} - {message}\n", color)
+        self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
+        
+        # Also log to file
+        logging.info(message)
+        
+    def set_status(self, message, is_error=False):
+        """Update status label"""
+        self.status_var.set(message)
+        self.status_label.configure(foreground="red" if is_error else "green")
+        
+    def update_timer(self, time_left):
+        """Update timer display"""
+        self.time_left = time_left
+        self.timer_var.set(f"Time: {time_left}s")
+        
+    def start_timer(self, duration):
+        """Start countdown timer"""
+        self.update_timer(duration)
+        if self.timer_event:
+            self.root.after_cancel(self.timer_event)
+        self.timer_event = self.root.after(1000, self._timer_tick, duration)
+        
+    def _timer_tick(self, time_left):
+        """Timer tick handler"""
+        if time_left <= 0 or not self.quiz_active:
+            return
+            
+        self.update_timer(time_left)
+        self.timer_event = self.root.after(1000, self._timer_tick, time_left - 1)
+        
+    def stop_timer(self):
+        """Stop the timer"""
+        if self.timer_event:
+            self.root.after_cancel(self.timer_event)
+            self.timer_event = None
+            
+    def clear_options(self):
+        """Clear answer options"""
+        for button in self.answer_buttons:
+            button.destroy()
+        self.answer_buttons = []
+        
+    def create_option_buttons(self, options):
+        """Create buttons for answer options"""
+        self.clear_options()
+        
+        for i, option in enumerate(options):
+            # Create a styled button for each option
+            btn = tk.Button(self.options_frame, text=option, font=('Arial', 10),
+                           command=lambda opt=option: self.submit_answer_gui(opt),
+                           bg='#e0e0e0', activebackground='#d0d0d0',
+                           relief=tk.RAISED, bd=2, padx=10, pady=5,
+                           wraplength=600, justify=tk.LEFT)
+            btn.grid(row=i, column=0, sticky=(tk.W, tk.E), pady=2)
+            self.answer_buttons.append(btn)
+            
+    def submit_answer_gui(self, answer):
+        """Submit answer from GUI button"""
+        if not self.quiz_active or not self.current_question:
+            return
+            
+        # Extract just the answer letter (A, B, C, D)
+        answer_letter = answer[0] if answer and len(answer) > 2 else answer
+        self.submit_answer(answer_letter)
+        
+    def login(self):
+        """Handle login"""
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+        
+        if not username or not password:
+            messagebox.showerror("Error", "Please enter both username and password")
+            return
+            
+        # Disable login button during attempt
+        self.login_button.config(state=tk.DISABLED)
+        self.log_message(f"Attempting to login as {username}...")
+        
+        # Run authentication in thread
+        Thread(target=self._authenticate_thread, args=(username, password), daemon=True).start()
+        
+    def _authenticate_thread(self, username, password):
+        """Authentication in separate thread"""
         try:
-            payload = json.dumps(data)
-        except (TypeError, ValueError, json.JSONDecodeError) as e:
-            raise DataFormatError(f"Failed to serialize message: {e}") from e
-        try:
-            await ws.send(payload)
-        except (ConnectionClosed, WebSocketException) as e:
-            raise NetworkError(f"Failed to send: {e}") from e
-    except QuizError as e:
-        logging.exception("Send error: %s", e)
-
-
-async def listener(ws):
-    """Listen for server messages and enqueue them."""
-    try:
-        async for message in ws:
-            try:
-                msg = json.loads(message)
-                await recv_queue.put(msg)
-            except (UnicodeDecodeError, json.JSONDecodeError) as e:
-                logging.exception("Malformed JSON from server: %s", e)
-                continue
-    except ConnectionClosed:
-        logging.info("Server closed connection")
-    except Exception as e:
-        logging.exception("Listener error: %s", e)
-        raise NetworkError(f"recv failed: {e}") from e
-
-
-async def send_with_ack(ws, msg, expected_ack_type, seq, timeout=ACK_TIMEOUT, retries=ACK_RETRIES):
-    """Send message and wait for a matching ACK on recv_queue."""
-    last_err = None
-    for attempt in range(retries):
-        try:
-            await send_json(ws, msg)
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    incoming = await asyncio.wait_for(recv_queue.get(), timeout=deadline - time.time())
-                except asyncio.TimeoutError:
-                    break
-                if incoming.get('type') == expected_ack_type and incoming.get('seq') == seq:
-                    return True
-                else:
-                    # not the ack we want; keep for the main loop
-                    # stash it by putting back
-                    await recv_queue.put(incoming)
-                    break
+            session_id = self.authenticate(username, password)
+            self.username = username
+            self.session_id = session_id
+            
+            # Update GUI in main thread
+            self.root.after(0, self._login_success, username)
+            
         except Exception as e:
-            last_err = e
-            logging.exception("send_with_ack exception: %s", e)
-        await asyncio.sleep(0.5 * (attempt + 1))
-    logging.warning("No ACK received for seq %s after %d tries. Last error: %s", seq, retries, last_err)
-    return False
-
-
-async def process_messages(ws):
-    """Main processor for messages from server (questions, results, leaderboard)."""
-    while not stop_event.is_set():
+            self.root.after(0, self._login_failed, str(e))
+            
+    def _login_success(self, username):
+        """Handle successful login"""
+        self.set_status(f"Connected as {username}")
+        self.start_button.config(state=tk.NORMAL)
+        self.leaderboard_button.config(state=tk.NORMAL)
+        self.login_button.config(state=tk.DISABLED)
+        self.log_message(f"✅ Successfully logged in as {username}")
+        messagebox.showinfo("Success", f"Logged in successfully as {username}")
+        
+    def _login_failed(self, error_msg):
+        """Handle failed login"""
+        self.set_status("Login failed", True)
+        self.login_button.config(state=tk.NORMAL)
+        self.log_message(f"❌ Login failed: {error_msg}")
+        messagebox.showerror("Login Failed", f"Authentication failed: {error_msg}")
+        
+    def start_quiz(self):
+        """Start the quiz"""
+        if not self.session_id:
+            messagebox.showerror("Error", "Please login first")
+            return
+            
+        self.start_button.config(state=tk.DISABLED)
+        self.quiz_active = True
+        self.log_message("Starting quiz...")
+        
+        # Run quiz in separate thread
+        Thread(target=self._run_quiz_thread, daemon=True).start()
+        
+    def _run_quiz_thread(self):
+        """Run quiz in separate thread"""
         try:
-            msg = await asyncio.wait_for(recv_queue.get(), timeout=1.0)
-        except asyncio.TimeoutError:
-            continue
-        mtype = msg.get('type')
-        if mtype == 'question':
-            seq = msg.get('seq')
-            print("\nQuestion:", msg.get('question'))
-            for opt in msg.get('options', []):
-                print(opt)
-            print(f"You have {msg.get('time')} seconds. Enter A/B/C/D (or press Enter to skip):")
-
-            # Send ACK for question receipt
-            ack = {'type': 'ack', 'seq': seq}
-            await send_json(ws, ack)
-
-            # read answer with timeout
-            answer_holder = {'answer': None}
-            loop = asyncio.get_event_loop()
+            self.run_quiz_gui()
+        except Exception as e:
+            self.root.after(0, self._quiz_error, str(e))
             
-            def read_input():
-                try:
-                    ans = input().strip().upper()
-                    answer_holder['answer'] = ans if ans else None
-                except Exception:
-                    answer_holder['answer'] = None
-
-            # Run input in executor to avoid blocking
-            try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, read_input),
-                    timeout=msg.get('time', 15)
-                )
-            except asyncio.TimeoutError:
-                pass
+    def _quiz_error(self, error_msg):
+        """Handle quiz error"""
+        self.quiz_active = False
+        self.stop_timer()
+        self.set_status("Quiz error", True)
+        self.start_button.config(state=tk.NORMAL)
+        self.log_message(f"❌ Quiz error: {error_msg}")
+        messagebox.showerror("Quiz Error", f"An error occurred: {error_msg}")
+        
+    def show_leaderboard(self):
+        """Show leaderboard"""
+        if not self.session_id:
+            messagebox.showerror("Error", "Please login first")
+            return
             
-            ans = answer_holder['answer']
-            answer_msg = {'type': 'answer', 'seq': seq, 'answer': ans}
-            await send_json(ws, answer_msg)
-
-        elif mtype == 'result':
-            if msg.get('status') == 'correct':
-                print("✅ Correct!")
-            else:
-                print(f"❌ Wrong. Correct answer: {msg.get('correct')}")
-        elif mtype == 'leaderboard':
-            print("\n🏆 Leaderboard:")
-            for u, s in msg.get('leaderboard', []):
-                print(f"{u}: {s}")
-        elif mtype == 'auth_ack':
-            # handled by send_with_ack flow normally
-            await recv_queue.put(msg)
-        elif mtype == 'ack':
-            # put back so waiting send_with_ack can detect it
-            await recv_queue.put(msg)
-        else:
-            logging.info("Unhandled message type: %s", mtype)
-
-
-async def authenticate_and_run(username, password):
-    """Authenticate to server with retries and run listener + processor."""
-    backoff_idx = 0
-    while True:
-        ws = None
+        Thread(target=self._get_leaderboard_thread, daemon=True).start()
+        
+    def _get_leaderboard_thread(self):
+        """Get leaderboard in separate thread"""
         try:
-            # Connect to WebSocket server
-            try:
-                ws = await websockets.connect(WS_URL)
-                logging.info("Connected to WebSocket server")
-            except Exception as e:
-                raise NetworkError(f"Failed to connect to {WS_URL}: {e}") from e
-
-            # start listener task
-            listener_task = asyncio.create_task(listener(ws))
-
-            seq = random.randint(1, 1_000_000)
-            auth_msg = {'type': 'auth', 'username': username, 'password': password, 'seq': seq}
+            leaderboard_data = self.get_leaderboard()
+            self.root.after(0, self._display_leaderboard, leaderboard_data)
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to get leaderboard: {e}"))
             
-            # Send auth message and wait for auth_ack response
-            logging.info("Sending auth message with seq %s", seq)
-            await send_json(ws, auth_msg)
+    def _display_leaderboard(self, leaderboard_data):
+        """Display leaderboard in new window"""
+        leaderboard = leaderboard_data.get('leaderboard', [])
+        
+        # Create new window
+        leaderboard_window = tk.Toplevel(self.root)
+        leaderboard_window.title("Leaderboard")
+        leaderboard_window.geometry("300x400")
+        
+        # Create treeview
+        tree = ttk.Treeview(leaderboard_window, columns=('Rank', 'Username', 'Score'), show='headings')
+        tree.heading('Rank', text='Rank')
+        tree.heading('Username', text='Username')
+        tree.heading('Score', text='Score')
+        
+        # Add data
+        for i, (username, score) in enumerate(leaderboard, 1):
+            tree.insert('', tk.END, values=(i, username, score))
             
-            # Wait for auth_ack response
-            auth_response = None
-            deadline = time.time() + 5  # 5 second timeout
-            while time.time() < deadline:
-                try:
-                    timeout = max(0.1, deadline - time.time())
-                    incoming = await asyncio.wait_for(recv_queue.get(), timeout=timeout)
-                    logging.debug("Received message type: %s, seq: %s (waiting for auth_ack, seq: %s)", 
-                                incoming.get('type'), incoming.get('seq'), seq)
-                except asyncio.TimeoutError:
-                    logging.debug("Timeout waiting for auth_ack, time remaining: %.2f", deadline - time.time())
-                    break
-                if incoming.get('type') == 'auth_ack' and incoming.get('seq') == seq:
-                    auth_response = incoming
-                    logging.info("Received auth_ack with status: %s", incoming.get('status'))
-                    break
-                else:
-                    # Put back for other handlers, continue looking
-                    await recv_queue.put(incoming)
-                    continue
-            
-            if not auth_response:
-                raise AuthError("No authentication response from server.")
-            if auth_response.get('status') != 'ok':
-                raise AuthError("Authentication failed.")
-
-            print(f"✅ Authenticated as {username}. Waiting for quiz...")
-            # start message processor
-            processor_task = asyncio.create_task(process_messages(ws))
-
-            # keep alive loop - wait for tasks to complete
-            done, pending = await asyncio.wait(
-                [listener_task, processor_task],
-                return_when=asyncio.FIRST_COMPLETED
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+    # Original API methods adapted for GUI
+    def authenticate(self, username, password):
+        """Authenticate user and return session ID."""
+        try:
+            response = session.post(
+                f"{BASE_URL}/api/auth",
+                json={'username': username, 'password': password},
+                timeout=5
             )
+            response.raise_for_status()
+            data = response.json()
             
-            # If either task completed, reconnect
-            if done:
-                logging.info("Connection lost, reconnecting...")
-                for task in pending:
-                    task.cancel()
-                break
-
-        except AuthError as e:
-            logging.exception("Authentication error: %s", e)
-            print("⚠️ Authentication error:", e)
-            # Give the user another chance to login with new credentials immediately
-            # Clear queue
-            while not recv_queue.empty():
-                try:
-                    await recv_queue.get()
-                except:
-                    break
-            backoff_idx = 0
-            print("Please try logging in again.")
-            loop = asyncio.get_event_loop()
-            username = await loop.run_in_executor(None, input, "Username: ")
-            username = username.strip()
-            password = await loop.run_in_executor(None, input, "Password: ")
-            password = password.strip()
-            continue
-        except QuizError as e:
-            logging.exception("Quiz error: %s", e)
-            print("⚠️ Quiz error:", e)
-            backoff = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF)-1)]
-            backoff_idx += 1
-            print(f"Reconnecting in {backoff} seconds...")
-            await asyncio.sleep(backoff)
-            # Clear queue
-            while not recv_queue.empty():
-                try:
-                    await recv_queue.get()
-                except:
-                    break
-            continue
+            if data.get('status') == 'ok':
+                session_id = data.get('session_id')
+                logging.info("Authenticated as %s, session_id: %s", username, session_id)
+                return session_id
+            else:
+                raise AuthError("Authentication failed")
+                
+        except RequestException as e:
+            raise NetworkError(f"Failed to authenticate: {e}") from e
         except Exception as e:
-            logging.exception("Connection/auth error: %s", e)
-            print("⚠️ Connection/auth error:", e)
-            backoff = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF)-1)]
-            backoff_idx += 1
-            print(f"Reconnecting in {backoff} seconds...")
-            await asyncio.sleep(backoff)
-            # Clear queue
-            while not recv_queue.empty():
-                try:
-                    await recv_queue.get()
-                except:
+            if isinstance(e, (AuthError, NetworkError)):
+                raise
+            raise AuthError(f"Authentication error: {e}") from e
+
+    def start_quiz_gui(self):
+        """Start quiz session for GUI."""
+        try:
+            response = session.get(
+                f"{BASE_URL}/api/quiz/start",
+                headers={'X-Session-ID': self.session_id},
+                timeout=5
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('status') == 'ok':
+                self.root.after(0, self.log_message, 
+                               f"Quiz started: {data.get('total_questions')} questions, {data.get('question_time')} seconds per question")
+                return data
+            else:
+                raise QuizError("Failed to start quiz")
+                
+        except RequestException as e:
+            raise NetworkError(f"Failed to start quiz: {e}") from e
+        except Exception as e:
+            if isinstance(e, (QuizError, NetworkError)):
+                raise
+            raise QuizError(f"Start quiz error: {e}") from e
+
+    def get_question(self):
+        """Get current question."""
+        try:
+            response = session.get(
+                f"{BASE_URL}/api/quiz/question",
+                headers={'X-Session-ID': self.session_id},
+                timeout=5
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('status') == 'completed':
+                return None  # Quiz completed
+            
+            return data
+                
+        except RequestException as e:
+            raise NetworkError(f"Failed to get question: {e}") from e
+        except Exception as e:
+            if isinstance(e, NetworkError):
+                raise
+            raise NetworkError(f"Get question error: {e}") from e
+
+    def submit_answer(self, answer):
+        """Submit answer for current question."""
+        if not self.current_question:
+            return
+            
+        try:
+            response = session.post(
+                f"{BASE_URL}/api/quiz/answer",
+                headers={'X-Session-ID': self.session_id},
+                json={'answer': answer, 'seq': self.current_question.get('seq')},
+                timeout=5
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            # Update GUI with result
+            self.root.after(0, self._handle_answer_result, result, answer)
+                
+        except RequestException as e:
+            self.root.after(0, self.log_message, f"❌ Failed to submit answer: {e}")
+        except Exception as e:
+            self.root.after(0, self.log_message, f"❌ Submit answer error: {e}")
+
+    def _handle_answer_result(self, result, submitted_answer):
+        """Handle answer submission result"""
+        if result.get('status') == 'correct':
+            self.log_message("✅ Correct!")
+        else:
+            correct_answer = result.get('correct_answer')
+            self.log_message(f"❌ Wrong. Correct answer: {correct_answer}")
+        
+        current_score = result.get('score', 0)
+        current_index = self.current_question.get('index', 0)
+        self.score_var.set(f"Score: {current_score}/{current_index}")
+        self.log_message(f"Current score: {current_score}/{current_index}")
+
+    def get_leaderboard(self):
+        """Get current leaderboard."""
+        try:
+            response = session.get(
+                f"{BASE_URL}/api/quiz/leaderboard",
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+                
+        except RequestException as e:
+            raise NetworkError(f"Failed to get leaderboard: {e}") from e
+        except Exception as e:
+            if isinstance(e, NetworkError):
+                raise
+            raise NetworkError(f"Get leaderboard error: {e}") from e
+
+    def run_quiz_gui(self):
+        """Run the quiz with GUI updates."""
+        try:
+            # Start quiz
+            quiz_info = self.start_quiz_gui()
+            total_questions = quiz_info.get('total_questions', 0)
+            question_time = quiz_info.get('question_time', QUESTION_TIME)
+            
+            self.root.after(0, self.set_status, "Quiz in progress...")
+            self.root.after(0, self.log_message, 
+                          f"✅ Quiz started! {total_questions} questions, {question_time} seconds per question")
+            
+            while self.quiz_active and not self.stop_event.is_set():
+                # Get current question
+                question_data = self.get_question()
+                
+                if question_data is None:
+                    # Quiz completed
+                    self.root.after(0, self._quiz_completed)
                     break
-            continue
-        finally:
-            if ws:
-                try:
-                    await ws.close()
-                except:
-                    pass
+                
+                if question_data.get('status') != 'ok':
+                    self.root.after(0, self.log_message, f"Unexpected question status: {question_data.get('status')}")
+                    break
+                
+                # Update current question
+                self.current_question = question_data
+                seq = question_data.get('seq')
+                index = question_data.get('index')
+                question = question_data.get('question')
+                options = question_data.get('options', [])
+                
+                # Update GUI with question
+                self.root.after(0, self._display_question, index, total_questions, question, options, question_time)
+                
+                # Wait for answer submission or timeout
+                self.stop_event.clear()
+                self.stop_event.wait(question_time)
+                
+                # If time's up and no answer submitted, submit empty answer
+                if not self.stop_event.is_set():
+                    self.root.after(0, self.log_message, "⏰ Time's up!")
+                    self.submit_answer(None)
+                
+                time.sleep(1)  # Brief pause before next question
+            
+            # Get final leaderboard
+            if not self.stop_event.is_set():
+                leaderboard_data = self.get_leaderboard()
+                self.root.after(0, self._display_final_leaderboard, leaderboard_data, 
+                              self.current_question.get('score', 0) if self.current_question else 0, 
+                              total_questions)
+                
+        except Exception as e:
+            self.root.after(0, self._quiz_error, str(e))
 
+    def _display_question(self, index, total_questions, question, options, question_time):
+        """Display question in GUI"""
+        self.show_question()
+        self.question_var.set(f"Question {index}/{total_questions}: {question}")
+        self.create_option_buttons(options)
+        self.start_timer(question_time)
+        self.log_message(f"Question {index}/{total_questions}: {question}")
 
-async def main():
-    """Main client logic."""
-    loop = asyncio.get_event_loop()
-    username = await loop.run_in_executor(None, input, "Username: ")
-    username = username.strip()
-    password = await loop.run_in_executor(None, input, "Password: ")
-    password = password.strip()
-    try:
-        await authenticate_and_run(username, password)
-    except KeyboardInterrupt:
-        print("\n🛑 Client exiting...")
-    finally:
-        stop_event.set()
-        print("🔌 Connection closed.")
+    def _quiz_completed(self):
+        """Handle quiz completion"""
+        self.quiz_active = False
+        self.stop_timer()
+        self.set_status("Quiz completed")
+        self.hide_question()
+        self.clear_options()
+        self.log_message("🎉 Quiz completed!")
 
+    def _display_final_leaderboard(self, leaderboard_data, final_score, total_questions):
+        """Display final leaderboard"""
+        leaderboard = leaderboard_data.get('leaderboard', [])
+        
+        self.log_message("\n🏆 Final Leaderboard:")
+        for username, score in leaderboard:
+            self.log_message(f"  {username}: {score}")
+        
+        self.log_message(f"🎯 Your final score: {final_score}/{total_questions}")
+        self.start_button.config(state=tk.NORMAL)
+        
+        # Show final results in message box
+        messagebox.showinfo("Quiz Completed", 
+                          f"Quiz completed!\nYour final score: {final_score}/{total_questions}")
+
+    def on_closing(self):
+        """Handle window closing"""
+        self.quiz_active = False
+        self.stop_event.set()
+        self.stop_timer()
+        self.root.destroy()
+
+def main():
+    """Main client logic with GUI"""
+    root = tk.Tk()
+    app = QuizClientGUI(root)
+    
+    # Handle window closing
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    
+    # Center the window
+    root.eval('tk::PlaceWindow . center')
+    
+    root.mainloop()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n🛑 Client exiting...")
+    main()
